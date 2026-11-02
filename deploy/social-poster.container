@@ -1,0 +1,62 @@
+# Quadlet unit for rootless Podman. Install to:
+#   ~/.config/containers/systemd/social-poster.container
+# then:
+#   systemctl --user daemon-reload && systemctl --user enable --now social-poster
+#   loginctl enable-linger $USER      # start at boot without a login session
+#
+# Secrets:
+#   openssl rand -hex 32 | podman secret create poster_master_key -
+#
+# The app binds only to loopback on the host (127.0.0.1:8787). Expose the UI to your tailnet with
+#   tailscale serve --bg --https=443 http://127.0.0.1:8787
+# Never use `tailscale funnel`.
+
+[Unit]
+Description=Social Poster for Hermes (X, Farcaster, LinkedIn, Nostr, Bluesky)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/roman-24/hermes-social-poster:latest
+ContainerName=social-poster
+AutoUpdate=registry
+
+# Loopback only. Hermes (on the host) talks to 127.0.0.1:8787/mcp.
+PublishPort=127.0.0.1:8787:8787
+
+# Persistent data: SQLite, media, browser profiles, debug screenshots, backups.
+Volume=poster-data:/data:Z
+# SimpleX attachments, read-only. Adjust the host path to the daemon's files folder.
+Volume=/home/admin/.simplex/files:/inbox:ro,z
+
+Secret=poster_master_key,mode=0400
+
+Environment=INBOX_HOST_PREFIX=/home/admin/.simplex/files
+Environment=LOG_LEVEL=info
+# Hostname Tailscale serves the UI on (also set in Settings → Allowed hosts):
+# Environment=POSTER_ALLOWED_HOSTS=poster.your-tailnet.ts.net
+# Environment=POSTER_PUBLIC_URL=https://poster.your-tailnet.ts.net
+Environment=TRUST_PROXY=1
+
+# Hardening
+ReadOnly=true
+ReadOnlyTmpfs=true
+Tmpfs=/tmp:rw,size=512m
+DropCapability=ALL
+NoNewPrivileges=true
+# Chromium's sandbox needs user namespaces; rootless Podman provides them. Do not add --no-sandbox.
+SecurityLabelDisable=false
+# Hermes webhook adapter on the host (bind it to loopback; pasta maps host loopback for the container).
+AddHost=host.containers.internal:host-gateway
+
+HealthCmd=node -e "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+HealthInterval=30s
+HealthRetries=3
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

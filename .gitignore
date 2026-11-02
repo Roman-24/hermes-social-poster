@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+apps/server/public/
+*.tsbuildinfo
+
+# runtime data (never commit)
+data/
+/inbox/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+
+# test / coverage
+coverage/
+test-results/
+playwright-report/
+.vitest/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.log

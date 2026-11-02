@@ -1,0 +1,48 @@
+{
+  "name": "@poster/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fastify server: MCP (Streamable HTTP) + REST + WebSocket + static UI, scheduler, media pipeline, vault, notifier.",
+  "bin": {
+    "poster": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "cli": "tsx src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.0",
+    "@fastify/multipart": "^10.0.0",
+    "@fastify/rate-limit": "^11.0.0",
+    "@fastify/static": "^10.0.0",
+    "@fastify/websocket": "^11.0.0",
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "@poster/adapters": "workspace:*",
+    "@poster/core": "workspace:*",
+    "argon2": "^0.45.0",
+    "better-sqlite3": "^12.4.0",
+    "drizzle-orm": "^0.45.0",
+    "fastify": "^5.6.0",
+    "fastify-type-provider-zod": "^7.0.0",
+    "file-type": "^21.0.0",
+    "luxon": "^3.7.0",
+    "otpauth": "^9.4.0",
+    "pino": "^10.0.0",
+    "sharp": "^0.34.0",
+    "ulid": "^3.0.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/luxon": "^3.7.0",
+    "drizzle-kit": "^0.31.0",
+    "msw": "^2.11.0",
+    "pino-pretty": "^13.0.0"
+  }
+}

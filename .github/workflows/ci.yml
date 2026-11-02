@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install ffmpeg (media tests)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @poster/core build
+      - run: pnpm --filter @poster/adapters build
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm format:check
+      - run: pnpm test
+      - run: pnpm --filter @poster/web build
+      - run: pnpm --filter @poster/server build
+      - name: Audit dependencies
+        run: pnpm audit --prod --audit-level=high || true
+
+  container:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: podman build -f Containerfile -t ghcr.io/${{ github.repository_owner }}/hermes-social-poster:${{ github.sha }} .
+      - name: Push image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+          podman tag ghcr.io/${{ github.repository_owner }}/hermes-social-poster:${{ github.sha }} ghcr.io/${{ github.repository_owner }}/hermes-social-poster:latest
+          podman push ghcr.io/${{ github.repository_owner }}/hermes-social-poster:${{ github.sha }}
+          podman push ghcr.io/${{ github.repository_owner }}/hermes-social-poster:latest

@@ -1,0 +1,43 @@
+# Snippets for ~/.hermes/config.yaml on the Hermes host.
+#
+# 1) MCP server (Streamable HTTP, loopback). Generate the token inside the container:
+#      podman exec -it social-poster poster gen-token mcp
+#    then put it in the environment Hermes reads (e.g. ~/.hermes/.env):
+#      SOCIAL_POSTER_MCP_TOKEN=spm_...
+mcp_servers:
+  social_poster:
+    url: 'http://127.0.0.1:8787/mcp'
+    headers:
+      Authorization: 'Bearer ${SOCIAL_POSTER_MCP_TOKEN}'
+
+# 2) Webhook adapter: the poster POSTs signed JSON events to
+#      http://host.containers.internal:8644/webhooks/<route>
+#    with header  X-Webhook-Signature: sha256=<hmac-sha256(body, WEBHOOK_SECRET)>.
+#    Set the same secret in the poster UI (Settings → Hermes → Webhook secret) and the base URL
+#    http://host.containers.internal:8644 (or the Podman host-gateway address).
+#
+#    Route "poster-direct" MUST be deliver_only: it carries the confirmation code straight to you in
+#    SimpleX without the agent ever seeing it. Every event has a `message` field with the text to show.
+#    Route "poster-agent" (optional) runs the agent for MISSED_WINDOW / UNKNOWN_OUTCOME decisions.
+#
+#    Environment (~/.hermes/.env):
+#      WEBHOOK_ENABLED=true
+#      WEBHOOK_PORT=8644
+#      WEBHOOK_SECRET=<strong random secret>
+#      SIMPLEX_ALLOWED_USERS=<your contactId>      # see docs/security.md
+webhooks:
+  routes:
+    poster-direct:
+      deliver: simplex
+      deliver_only: true
+      deliver_extra:
+        chat_id: '<your SimpleX contactId>'
+      template: '{{ message }}'
+    poster-agent:
+      deliver: simplex
+      deliver_extra:
+        chat_id: '<your SimpleX contactId>'
+      prompt: |
+        A scheduled social post needs a decision. Event: {{ event }} for post {{ postId }} on {{ network }}.
+        {{ message }}
+        Ask the user whether to post it now (use reschedule_post with "now" after they confirm with the new code) or cancel it.

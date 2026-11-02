@@ -1,0 +1,38 @@
+{
+  "name": "@poster/adapters",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Network adapters: X (rettiwt + Playwright fallback), Farcaster (Playwright), LinkedIn (REST), Nostr (nostr-tools + Blossom), Bluesky (@atproto/api), plus the shared browser manager.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@atproto/api": "^0.30.0",
+    "@noble/hashes": "^1.8.0",
+    "@poster/core": "workspace:*",
+    "nostr-tools": "^2.25.0",
+    "playwright-core": "^1.64.0",
+    "rettiwt-api": "^7.1.0",
+    "ws": "^8.18.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.0",
+    "msw": "^2.11.0"
+  }
+}

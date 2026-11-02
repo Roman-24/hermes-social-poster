@@ -1,0 +1,14 @@
+node_modules
+**/node_modules
+**/dist
+apps/server/public
+data
+.git
+.github
+*.md
+!README.md
+coverage
+.vitest
+*.log
+.env
+.env.*
