@@ -13,7 +13,7 @@ ARG PLAYWRIGHT_IMAGE=mcr.microsoft.com/playwright:v1.64.1-noble
 # ---------------------------------------------------------------------------
 FROM ${PLAYWRIGHT_IMAGE} AS build
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH CI=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-RUN corepack enable && corepack prepare pnpm@10.28.0 --activate
+RUN npm install -g pnpm@10.28.0
 WORKDIR /src
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./

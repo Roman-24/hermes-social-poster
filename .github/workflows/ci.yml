@@ -44,13 +44,16 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - name: Compute image name
+        # OCI repository names must be lowercase; the GitHub owner may not be (Roman-24).
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/hermes-social-poster" >> "$GITHUB_ENV"
       - name: Build image
-        run: podman build -f Containerfile -t ghcr.io/${{ github.repository_owner }}/hermes-social-poster:${{ github.sha }} .
+        run: podman build -f Containerfile -t "$IMAGE:$GITHUB_SHA" .
       - name: Push image
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "$GHCR_TOKEN" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
-          podman tag ghcr.io/${{ github.repository_owner }}/hermes-social-poster:${{ github.sha }} ghcr.io/${{ github.repository_owner }}/hermes-social-poster:latest
-          podman push ghcr.io/${{ github.repository_owner }}/hermes-social-poster:${{ github.sha }}
-          podman push ghcr.io/${{ github.repository_owner }}/hermes-social-poster:latest
+          echo "$GHCR_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          podman tag "$IMAGE:$GITHUB_SHA" "$IMAGE:latest"
+          podman push "$IMAGE:$GITHUB_SHA"
+          podman push "$IMAGE:latest"
