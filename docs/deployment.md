@@ -65,7 +65,8 @@ journalctl --user -u social-poster -f
 
 The unit mounts `poster-data:/data` (SQLite, media, browser profiles, debug screenshots,
 backups) and the SimpleX files folder read-only at `/inbox`. Root FS is read-only, all
-capabilities dropped, `no-new-privileges`. Chromium runs with its own sandbox (user namespaces).
+capabilities dropped, `no-new-privileges`. Chromium runs **without** its own sandbox
+(`--no-sandbox`, Playwright's default); see the Chromium note in `docs/security.md`.
 
 ## 4. First login
 
@@ -86,8 +87,13 @@ Open `https://poster.<tailnet>.ts.net`, log in, then in **Settings**:
   `https://poster.<tailnet>.ts.net/api/v1/accounts/linkedin/callback`).
 - Optional TOTP.
 
-Until the direct route works, the UI shows **soft mode**: codes are returned to Hermes in the
-tool result instead of going straight to you.
+Until the direct route works, no confirmation code is sent to Hermes at all: the System card shows
+that drafts can only be confirmed in the UI (Confirm button on the post). If you prefer the old
+**soft mode**, where the code is returned to Hermes in the tool result and the agent can confirm
+posts without you, switch it on under Settings → Hermes. It is off by default.
+
+Run Hermes under a different OS account from the one that runs the Podman container; see
+Known residual risks in `docs/security.md`.
 
 ## 5. Hermes
 

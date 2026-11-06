@@ -9,7 +9,10 @@ export interface BrowserManagerOptions {
   typingDelayMs?: { min: number; max: number };
   /** Default viewport for all contexts (also the remote screencast size). */
   viewport?: { width: number; height: number };
-  /** Extra Chromium args (e.g. for rootless Podman: --no-sandbox is NOT needed with user namespaces). */
+  /**
+   * Extra Chromium args. Note: Playwright itself adds --no-sandbox unless launchPersistentContext
+   * gets chromiumSandbox: true, which this manager does not pass, so Chromium's sandbox is off.
+   */
   extraArgs?: string[];
 }
 

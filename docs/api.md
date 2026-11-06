@@ -55,17 +55,17 @@ credential flows. LinkedIn also needs `linkedin.clientId` / `linkedin.clientSecr
 
 ### Drafts and posts
 
-| Method  | Path                                                 | Body → Response                                                                                          |
-| ------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `POST`  | `/drafts`                                            | `CreateDraftInput` → `DraftPreview` (`source: "ui"`)                                                     |
-| `PATCH` | `/drafts/:id`                                        | `UpdateDraftInput` minus `draftId` → `DraftPreview`                                                      |
-| `POST`  | `/drafts/:id/confirm`                                | `{ code? }` → `ConfirmResult`. A UI session may omit the code; API tokens must send it.                  |
-| `GET`   | `/posts?status=a,b&from=ISO&to=ISO&limit=50&cursor=` | → `PostList` (newest scheduled first for history; soonest first when `status` contains only open states) |
-| `GET`   | `/posts/:id`                                         | → `PostView` (targets include `attemptLog`)                                                              |
-| `POST`  | `/posts/:id/cancel`                                  | `{ networks? }` → `CancelResult`                                                                         |
-| `POST`  | `/posts/:id/retry`                                   | `{ networks? }` → `PostView` (re-queues failed / needs_auth targets now)                                 |
-| `POST`  | `/posts/:id/reschedule`                              | `{ schedule, networks? }` → `PostView` (UI session: applied directly; API token: `403`)                  |
-| `POST`  | `/posts/:id/post-now`                                | `{ networks? }` → `PostView` (used for `MISSED_WINDOW`)                                                  |
+| Method  | Path                                                 | Body → Response                                                                                                                                          |
+| ------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST`  | `/drafts`                                            | `CreateDraftInput` → `DraftPreview` (`source: "ui"`)                                                                                                     |
+| `PATCH` | `/drafts/:id`                                        | `UpdateDraftInput` minus `draftId` → `DraftPreview`                                                                                                      |
+| `POST`  | `/drafts/:id/confirm`                                | `{ code? }` → `ConfirmResult`. A UI session may omit the code; API tokens must send it. The code only confirms the draft content it was issued for.      |
+| `GET`   | `/posts?status=a,b&from=ISO&to=ISO&limit=50&cursor=` | → `PostList` (newest scheduled first for history; soonest first when `status` contains only open states)                                                 |
+| `GET`   | `/posts/:id`                                         | → `PostView` (targets include `attemptLog`)                                                                                                              |
+| `POST`  | `/posts/:id/cancel`                                  | `{ networks? }` → `CancelResult`                                                                                                                         |
+| `POST`  | `/posts/:id/retry`                                   | `{ networks? }` → `PostView` (re-queues failed / needs_auth targets of a confirmed post; UI session also cancelled ones)                                 |
+| `POST`  | `/posts/:id/reschedule`                              | `{ schedule, networks? }` → `PostView` (UI session: applied directly; API token: `403`)                                                                  |
+| `POST`  | `/posts/:id/post-now`                                | `{ networks? }` → `PostView` (used for `MISSED_WINDOW`; API tokens cannot pull a scheduled post forward or revive a cancelled or unconfirmed one: `409`) |
 
 ### Media
 
@@ -78,16 +78,16 @@ credential flows. LinkedIn also needs `linkedin.clientId` / `linkedin.clientSecr
 
 ### Settings, tokens, notifications, system
 
-| Method | Path                                  | Body → Response                                                                                                                                                    |
-| ------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET`  | `/settings`                           | → `SettingsView = Settings & { secretsSet: { hermesWebhookSecret, linkedinClientSecret, mcpToken, apiToken }, linkedinClientId: string \| null, effectiveLimits }` |
-| `PUT`  | `/settings`                           | `Partial<Settings> & { secrets?: { hermesWebhookSecret?, linkedinClientSecret?, linkedinClientId? } }` → `SettingsView`                                            |
-| `POST` | `/settings/tokens/:kind/rotate`       | `kind` = `mcp` \| `api`; body `{ scope?: "read" \| "write" }` for `api` → `{ token }` (shown once, never retrievable)                                              |
-| `POST` | `/settings/webhook/test`              | — → `{ ok, status?, error? }` sends a `self_test_failed`-shaped ping with `event: "test"`                                                                          |
-| `GET`  | `/notifications?undelivered=1&limit=` | → `NotificationView[]`                                                                                                                                             |
-| `POST` | `/notifications/:id/retry`            | → `NotificationView`                                                                                                                                               |
-| `GET`  | `/system`                             | → `{ version, uptimeMs, now, tz, codeDelivery: "direct" \| "returned", scheduler: { lastTickAt, lagMs, running }, counts: { scheduled, publishing, failed24h } }`  |
-| `GET`  | `/audit?limit=&cursor=`               | → `{ items: AuditEntry[], nextCursor }`                                                                                                                            |
+| Method | Path                                  | Body → Response                                                                                                                                                             |
+| ------ | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/settings`                           | → `SettingsView = Settings & { secretsSet: { hermesWebhookSecret, linkedinClientSecret, mcpToken, apiToken }, linkedinClientId: string \| null, effectiveLimits }`          |
+| `PUT`  | `/settings`                           | `Partial<Settings> & { secrets?: { hermesWebhookSecret?, linkedinClientSecret?, linkedinClientId? } }` → `SettingsView`                                                     |
+| `POST` | `/settings/tokens/:kind/rotate`       | `kind` = `mcp` \| `api`; body `{ scope?: "read" \| "write" }` for `api` → `{ token }` (shown once, never retrievable)                                                       |
+| `POST` | `/settings/webhook/test`              | — → `{ ok, status?, error? }` sends a `self_test_failed`-shaped ping with `event: "test"`                                                                                   |
+| `GET`  | `/notifications?undelivered=1&limit=` | → `NotificationView[]`                                                                                                                                                      |
+| `POST` | `/notifications/:id/retry`            | → `NotificationView`                                                                                                                                                        |
+| `GET`  | `/system`                             | → `{ version, uptimeMs, now, tz, codeDelivery: "direct" \| "returned" \| "none", scheduler: { lastTickAt, lagMs, running }, counts: { scheduled, publishing, failed24h } }` |
+| `GET`  | `/audit?limit=&cursor=`               | → `{ items: AuditEntry[], nextCursor }`                                                                                                                                     |
 
 ### Unauthenticated
 
@@ -153,5 +153,11 @@ Tools, all with zod input schemas from `@poster/core`:
 
 Tool results carry both `content[0].text` (a compact human-readable rendering the agent should
 show verbatim) and `structuredContent`. MCP never returns secrets, tokens, cookies or paths outside
-the inbox. In soft mode (no direct webhook route) `DraftPreview.code` is populated and
-`codeDelivery` is `"returned"`.
+the inbox. `DraftPreview.codeDelivery` is `"direct"` (the code went to you through the webhook
+route), `"returned"` (soft mode, switched on in Settings: `DraftPreview.code` is populated) or
+`"none"` (no code was issued: the draft has errors, is too large to show in full in the approval
+message, or no direct route is configured and soft mode is off; confirm it in the UI).
+
+Input limits (the same for MCP and REST): post text and per-network override text up to 10,000
+characters; at most 20 attachments per list (`mediaIds`, `mediaPaths`, `altTexts`, per-network
+`mediaIds`); at most 5 networks; schedule strings up to 64 characters; inbox files up to 600 MiB.

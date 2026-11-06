@@ -29,13 +29,17 @@ Volume=poster-data:/data:Z
 # SimpleX attachments, read-only. Adjust the host path to the daemon's files folder.
 Volume=/home/admin/.simplex/files:/inbox:ro,z
 
-Secret=poster_master_key,mode=0400
+# Podman creates secret files owned by root; the app runs as uid 1000 and could not read a 0400 file.
+Secret=poster_master_key,uid=1000,gid=1000,mode=0400
 
 Environment=INBOX_HOST_PREFIX=/home/admin/.simplex/files
 Environment=LOG_LEVEL=info
 # Hostname Tailscale serves the UI on (also set in Settings → Allowed hosts):
 # Environment=POSTER_ALLOWED_HOSTS=poster.your-tailnet.ts.net
 # Environment=POSTER_PUBLIC_URL=https://poster.your-tailnet.ts.net
+# Trust X-Forwarded-* from a loopback peer (tailscale serve). Only set it when the proxy is the only
+# thing that can reach this port as 127.0.0.1; any other local process that can connect could then
+# choose the client address that the login limiter uses. Accepts 1/true/yes/on and 0/false/no/off.
 Environment=TRUST_PROXY=1
 
 # Hardening
@@ -44,7 +48,10 @@ ReadOnlyTmpfs=true
 Tmpfs=/tmp:rw,size=512m
 DropCapability=ALL
 NoNewPrivileges=true
-# Chromium's sandbox needs user namespaces; rootless Podman provides them. Do not add --no-sandbox.
+# Chromium runs WITHOUT its own sandbox here: Playwright adds --no-sandbox unless chromiumSandbox is
+# true, and this build does not set it. Whether the sandbox can start under this unit's default
+# seccomp profile with DropCapability=ALL has not been verified. See docs/security.md before
+# changing it; a seccomp profile that permits user namespaces would be the way to turn it on.
 SecurityLabelDisable=false
 # Hermes webhook adapter on the host (bind it to loopback; pasta maps host loopback for the container).
 AddHost=host.containers.internal:host-gateway

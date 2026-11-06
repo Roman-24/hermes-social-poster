@@ -21,7 +21,8 @@ You (SimpleX) ──► Hermes ──MCP /mcp──► Social Poster ──► X
    split with `(1/n)` markers, media variants) and returns a preview with character counts and the
    resolved time in your zone and UTC.
 3. A 6-character confirmation code goes **directly to you** in SimpleX through a `deliver_only`
-   Hermes webhook route. The model never sees it.
+   Hermes webhook route. The model never sees it, and it only confirms the exact draft it was
+   issued for. Without that route no code is issued to the agent: confirm in the web UI instead.
 4. You reply `yes ABC123` (or ask for changes, or `cancel`). Hermes calls `confirm_post`.
 5. The scheduler publishes at the due time, one network at a time, retries transient failures
    (1, 5, 15 min), never retries ambiguous outcomes, and reports each result back to SimpleX.
@@ -106,8 +107,8 @@ and connect your accounts in the UI.
 
 - The container publishes one port on loopback only; the UI is reachable through
   `tailscale serve` (never `funnel`). Requests with an unexpected `Host` are rejected.
-- MCP has its own bearer token and can only draft, confirm (with a code), cancel, reschedule and
-  read. Settings, account connections and secrets are UI-only (password + optional TOTP, CSRF).
+- MCP has its own bearer token and can only draft, confirm (with a code that is bound to the draft
+  content), cancel, reschedule and read. Settings, account connections and secrets are UI-only (password + optional TOTP, CSRF).
 - Secrets are AES-256-GCM encrypted with a master key kept in a Podman secret file; the row id is
   the AAD so ciphertext cannot be moved between rows. `poster rotate-key` re-encrypts everything.
 - Logs redact tokens, cookies and passwords; the audit log records every create, confirm, cancel,
