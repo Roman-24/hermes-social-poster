@@ -9,30 +9,57 @@ import { AccountStatusSchema, PostStatusSchema, TargetStatusSchema } from './sta
 /* Inputs (shared by MCP tools and REST)                               */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Input bounds. Every field that reaches the renderer or the thread splitter is capped so that
+ * one request cannot occupy the single-threaded server for long. The caps sit well above anything
+ * a real post needs: the longest thread is 25 parts of a few hundred characters, and the highest
+ * default attachment count of any network is 20 (LinkedIn images).
+ */
+export const MAX_POST_TEXT = 10_000;
+export const MAX_ATTACHMENTS = 20;
+const MediaIdSchema = z.string().min(1).max(64);
+
 export const OverrideSchema = z.object({
-  text: z.string().optional().describe('Replace the base text for this network only'),
-  mediaIds: z.array(z.string()).optional().describe('Replace the media for this network only'),
+  text: z
+    .string()
+    .max(MAX_POST_TEXT)
+    .optional()
+    .describe('Replace the base text for this network only'),
+  mediaIds: z
+    .array(MediaIdSchema)
+    .max(MAX_ATTACHMENTS)
+    .optional()
+    .describe('Replace the media for this network only'),
 });
 
 export const CreateDraftInputSchema = z.object({
   text: z
     .string()
     .min(1)
-    .max(50_000)
+    .max(MAX_POST_TEXT)
     .describe('Base text. Use a line containing only --- to force thread part breaks.'),
-  networks: z.array(NetworkSchema).min(1).describe('Networks to publish to'),
+  networks: z.array(NetworkSchema).min(1).max(5).describe('Networks to publish to'),
   overrides: z
     .partialRecord(NetworkSchema, OverrideSchema)
     .optional()
     .describe('Per-network text/media overrides'),
   mediaPaths: z
-    .array(z.string())
+    .array(z.string().min(1).max(1024))
+    .max(MAX_ATTACHMENTS)
     .optional()
     .describe(
       'Absolute file paths reported by the SimpleX daemon (must be inside the inbox directory)',
     ),
-  mediaIds: z.array(z.string()).optional().describe('Ids returned by upload_media'),
-  altTexts: z.array(z.string()).optional().describe('Alt text per media item, in order'),
+  mediaIds: z
+    .array(MediaIdSchema)
+    .max(MAX_ATTACHMENTS)
+    .optional()
+    .describe('Ids returned by upload_media'),
+  altTexts: z
+    .array(z.string().max(4096))
+    .max(MAX_ATTACHMENTS)
+    .optional()
+    .describe('Alt text per media item, in order'),
   schedule: ScheduleInputSchema.optional().describe(
     '"now" (default), ISO 8601 with offset, or {at, tz}',
   ),
@@ -49,6 +76,9 @@ export type CreateDraftInput = z.infer<typeof CreateDraftInputSchema>;
 
 export const UpdateDraftInputSchema = CreateDraftInputSchema.partial().extend({
   draftId: z.string(),
+  // .partial() keeps the create default, which would silently reset an existing draft to 'auto'
+  // whenever an update leaves the field out.
+  thread: z.enum(['auto', 'off']).optional().describe('auto: split over-limit text; off: error'),
 });
 export type UpdateDraftInput = z.infer<typeof UpdateDraftInputSchema>;
 

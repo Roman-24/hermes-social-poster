@@ -31,7 +31,14 @@ export class ThreadSplitError extends Error {
   }
 }
 
-const MANUAL_SEPARATOR_RE = /^\s*---\s*$/m;
+/**
+ * A separator is a line holding only `---` and horizontal whitespace. The whitespace class must
+ * not match line breaks: with `\s*` the engine retries from every line start and the test is
+ * quadratic in the number of blank lines, which one draft request could turn into a long stall.
+ */
+const HSPACE = '[^\\S\\r\\n\\u2028\\u2029]*';
+const MANUAL_SEPARATOR_RE = new RegExp(`^${HSPACE}---${HSPACE}$`, 'm');
+const MANUAL_SEPARATOR_ALL_RE = new RegExp(`^${HSPACE}---${HSPACE}$`, 'gm');
 
 export function hasManualBreaks(text: string): boolean {
   return MANUAL_SEPARATOR_RE.test(text);
@@ -39,10 +46,14 @@ export function hasManualBreaks(text: string): boolean {
 
 /** Split on lines that are exactly `---`. */
 export function splitManual(text: string): string[] {
-  return text
-    .split(/\r?\n\s*---\s*\r?\n|^\s*---\s*\r?\n|\r?\n\s*---\s*$/m)
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
+  const parts: string[] = [];
+  let last = 0;
+  for (const m of text.matchAll(MANUAL_SEPARATOR_ALL_RE)) {
+    parts.push(text.slice(last, m.index));
+    last = m.index + m[0].length;
+  }
+  parts.push(text.slice(last));
+  return parts.map((p) => p.trim()).filter((p) => p.length > 0);
 }
 
 function renderMarker(format: string, i: number, n: number): string {

@@ -16,10 +16,11 @@ export const ScheduleInputSchema = z.union([
   z
     .string()
     .min(1)
+    .max(64)
     .describe('ISO 8601 date-time; include an offset or it is read in the default zone'),
   z.object({
-    at: z.string().min(1).describe('Local date-time, e.g. "2026-11-02 09:00"'),
-    tz: z.string().min(1).describe('IANA zone, e.g. "Europe/Prague"'),
+    at: z.string().min(1).max(64).describe('Local date-time, e.g. "2026-11-02 09:00"'),
+    tz: z.string().min(1).max(64).describe('IANA zone, e.g. "Europe/Prague"'),
   }),
 ]);
 export type ScheduleInput = z.infer<typeof ScheduleInputSchema>;

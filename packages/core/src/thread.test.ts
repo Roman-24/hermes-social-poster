@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { splitThread, ThreadSplitError } from './thread.js';
+import { hasManualBreaks, splitManual, splitThread, ThreadSplitError } from './thread.js';
 import { DEFAULT_LIMITS } from './limits.js';
 import { countWeighted, fits } from './text.js';
 
@@ -88,5 +88,36 @@ describe('splitThread', () => {
     expect(() => splitThread('word '.repeat(5000), { limits: X, maxParts: 5 })).toThrow(
       ThreadSplitError,
     );
+  });
+});
+
+
+describe('manual separators', () => {
+  it('detects and splits on lines holding only ---', () => {
+    expect(hasManualBreaks('a\n---\nb')).toBe(true);
+    expect(hasManualBreaks('a\n  ---  \nb')).toBe(true);
+    expect(hasManualBreaks('---\nb')).toBe(true);
+    expect(hasManualBreaks('a\n---')).toBe(true);
+    expect(hasManualBreaks('a --- b')).toBe(false);
+    expect(hasManualBreaks('a\n----\nb')).toBe(false);
+    expect(splitManual('one\n---\ntwo\r\n ---\r\nthree\n---')).toEqual(['one', 'two', 'three']);
+    expect(splitManual('---\nonly')).toEqual(['only']);
+  });
+
+  it('stays linear on very long runs of blank lines', () => {
+    const text = `a${'\n'.repeat(200_000)}b`;
+    const t0 = Date.now();
+    expect(hasManualBreaks(text)).toBe(false);
+    expect(splitManual(text)).toHaveLength(1);
+    expect(Date.now() - t0).toBeLessThan(1_000);
+  });
+});
+
+describe('weighted measurement of pathological tokens', () => {
+  it('does not run the quadratic parser on a very long whitespace-free run', () => {
+    const text = '1.'.repeat(25_000);
+    const t0 = Date.now();
+    expect(fits(text, X)).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(1_000);
   });
 });

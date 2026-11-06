@@ -151,7 +151,19 @@ export class Renderer {
     const mediaList =
       input.mediaByNetwork[network] ?? resolveOverrideMedia(input, network) ?? input.media;
     const refs: MediaRef[] = [];
-    for (const m of mediaList) {
+    // Count before work: a variant lookup is a database read, a file check and possibly an image
+    // re-encode per attachment, so a list the network can never accept must not reach it.
+    const maxAttachments = limits.images.max + (limits.video?.max ?? 0);
+    const tooMany = mediaList.length > maxAttachments;
+    if (tooMany) {
+      issues.push({
+        level: 'error',
+        code: 'TOO_MANY_MEDIA',
+        network,
+        message: `${mediaList.length} attachments, but ${network} accepts at most ${maxAttachments}.`,
+      });
+    }
+    for (const m of tooMany ? [] : mediaList) {
       try {
         const ref = await this.media.variantFor(m.info, network, limits);
         if (m.altText) ref.altText = m.altText;

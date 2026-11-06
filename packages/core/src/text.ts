@@ -17,8 +17,19 @@ export function countChars(text: string): number {
   return Array.from(text).length;
 }
 
+/**
+ * twitter-text backtracks badly on a long run of characters without whitespace (for example
+ * "1.1.1.1." repeated): the cost grows quadratically with the run length. No real post has a
+ * token this long, and such a token cannot fit any weighted limit anyway unless it is a URL, so
+ * past this length the plain code point count is returned instead of calling the parser. The
+ * count is only used to decide that the text is over the limit.
+ */
+const MAX_PARSE_RUN = 2_000;
+const LONG_RUN_RE = new RegExp(`\\S{${MAX_PARSE_RUN + 1},}`);
+
 /** X weighted length (URLs = 23, CJK = 2, emoji = 2). */
 export function countWeighted(text: string): number {
+  if (LONG_RUN_RE.test(text)) return countChars(text);
   return twitter.parseTweet(text).weightedLength;
 }
 
