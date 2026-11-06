@@ -94,6 +94,14 @@ export function usePostMutations(postId: string) {
     },
     onError,
   });
+  const confirm = useMutation({
+    mutationFn: () => postsApi.confirmDraft(postId),
+    onSuccess: () => {
+      invalidate();
+      toast.success('Confirmed', 'The post is queued and will publish at its scheduled time.');
+    },
+    onError,
+  });
   const reschedule = useMutation({
     mutationFn: (args: { at: string; tz: string; networks?: Network[] }) =>
       postsApi.reschedule(postId, { at: args.at, tz: args.tz }, args.networks),
@@ -103,7 +111,7 @@ export function usePostMutations(postId: string) {
     },
     onError,
   });
-  return { cancel, retry, postNow, reschedule };
+  return { cancel, retry, postNow, reschedule, confirm };
 }
 
 export function CancelDialog({
@@ -142,6 +150,31 @@ export function CancelDialog({
         filter={(s) => OPEN_TARGET.has(s) || s === 'pending'}
       />
     </ConfirmDialog>
+  );
+}
+
+export function ConfirmDraftDialog({
+  post,
+  open,
+  onOpenChange,
+}: {
+  post: PostView;
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+}) {
+  const { confirm } = usePostMutations(post.id);
+  return (
+    <ConfirmDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="Confirm and queue"
+      description={`Publishes this draft to ${post.targets
+        .map((t) => NETWORK_LABELS[t.network])
+        .join(', ')} at ${post.schedule.display}. Check the text first: this is the approval.`}
+      confirmLabel="Confirm and queue"
+      busy={confirm.isPending}
+      onConfirm={() => confirm.mutate(undefined, { onSuccess: () => onOpenChange(false) })}
+    />
   );
 }
 
@@ -274,7 +307,7 @@ export function RescheduleDialog({
 
 /** Row of action buttons with their dialogs, shared by Queue and Post detail. */
 export function PostActions({ post, compact = false }: { post: PostView; compact?: boolean }) {
-  const [dlg, setDlg] = React.useState<'cancel' | 'reschedule' | 'now' | null>(null);
+  const [dlg, setDlg] = React.useState<'cancel' | 'reschedule' | 'now' | 'confirm' | null>(null);
   const { retry } = usePostMutations(post.id);
   const hasOpen = post.targets.some((t) => OPEN_TARGET.has(t.status));
   const hasFailed = post.targets.some((t) => t.status === 'failed' || t.status === 'needs_auth');
@@ -285,8 +318,14 @@ export function PostActions({ post, compact = false }: { post: PostView; compact
     hasOpen ||
     hasFailed;
   const size = compact ? 'sm' : 'default';
+  const isDraft = post.status === 'draft';
   return (
     <div className="flex flex-wrap gap-2">
+      {isDraft ? (
+        <Button size={size} onClick={() => setDlg('confirm')}>
+          Confirm
+        </Button>
+      ) : null}
       {hasFailed ? (
         <Button
           size={size}
@@ -299,9 +338,11 @@ export function PostActions({ post, compact = false }: { post: PostView; compact
       ) : null}
       {canSchedule ? (
         <>
-          <Button size={size} variant="secondary" onClick={() => setDlg('now')}>
-            Post now
-          </Button>
+          {isDraft ? null : (
+            <Button size={size} variant="secondary" onClick={() => setDlg('now')}>
+              Post now
+            </Button>
+          )}
           <Button size={size} variant="outline" onClick={() => setDlg('reschedule')}>
             Reschedule
           </Button>
@@ -317,6 +358,11 @@ export function PostActions({ post, compact = false }: { post: PostView; compact
           Cancel
         </Button>
       ) : null}
+      <ConfirmDraftDialog
+        post={post}
+        open={dlg === 'confirm'}
+        onOpenChange={(o) => setDlg(o ? 'confirm' : null)}
+      />
       <CancelDialog
         post={post}
         open={dlg === 'cancel'}

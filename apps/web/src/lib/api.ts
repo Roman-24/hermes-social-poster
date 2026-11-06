@@ -58,7 +58,7 @@ export interface SystemInfo {
   uptimeMs: number;
   now: number;
   tz: string;
-  codeDelivery: 'direct' | 'returned';
+  codeDelivery: 'direct' | 'returned' | 'none';
   scheduler: { lastTickAt: number | null; lagMs: number | null; running: boolean };
   counts: { scheduled: number; publishing: number; failed24h: number };
 }

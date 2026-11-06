@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { and, asc, desc, eq, gte, inArray, lt, lte, ne, notInArray, sql } from 'drizzle-orm';
 import {
   derivePostStatus,
@@ -182,7 +183,21 @@ export class PostService {
         : null;
 
     this.db.transaction((tx) => {
+      // collectMediaIds awaited above, so the draft may have been confirmed in the meantime.
+      const current = tx
+        .select({ status: posts.status })
+        .from(posts)
+        .where(eq(posts.id, row.id))
+        .get();
+      if (current?.status !== 'draft') {
+        throw new PosterError(
+          'STATE_INVALID',
+          `Post ${row.id} is no longer a draft; it cannot be updated.`,
+        );
+      }
       tx.update(posts).set(set).where(eq(posts.id, row.id)).run();
+      // The old code approved the old content: drop it in the same step as the change.
+      this.codes.invalidate(row.id);
       if (mediaIds !== null || input.overrides !== undefined) {
         const ids = mediaIds ?? this.postMediaIds(row.id);
         tx.delete(postMedia).where(eq(postMedia.postId, row.id)).run();
@@ -229,9 +244,23 @@ export class PostService {
     return this.previewAndIssueCode(row.id, actor);
   }
 
-  /** Recompute the preview and issue a fresh confirmation code (invalidating the old one). */
+  /**
+   * Recompute the preview and issue a fresh confirmation code (invalidating the old one).
+   * The code is bound to a digest of the content that was rendered, and the digest is re-checked
+   * after the render, so a code is never issued for content other than the one previewed.
+   */
   async previewAndIssueCode(postId: string, actor: Actor): Promise<DraftPreview> {
-    const preview = await this.preview(postId);
+    let digest = this.contentDigest(postId);
+    let preview = await this.preview(postId);
+    for (let tries = 0; this.contentDigest(postId) !== digest; tries++) {
+      if (tries >= 3)
+        throw new PosterError(
+          'STATE_INVALID',
+          'The draft is being changed by another request. Try again.',
+        );
+      digest = this.contentDigest(postId);
+      preview = await this.preview(postId);
+    }
     const row = this.getRow(postId);
     if (row.status !== 'draft') return preview;
     const errors = preview.errors;
@@ -240,15 +269,38 @@ export class PostService {
       this.codes.invalidate(postId);
       return { ...preview, codeDelivery: 'none', codeExpiresAt: null };
     }
-    const direct = this.notifier.directRouteConfigured();
-    const { code, expiresAt } = await this.codes.issue(postId, direct ? 'direct' : 'returned');
-    if (direct) {
+    const mode = this.notifier.codeDeliveryMode();
+    if (mode === 'none') {
+      // No direct route and soft mode is off: no code exists for the agent to pass on, so the
+      // only way to confirm is the UI. Fail closed rather than hand the code to the agent.
+      this.codes.invalidate(postId);
+      return {
+        ...preview,
+        warnings: [...preview.warnings, NO_CODE_ROUTE_NOTICE],
+        codeDelivery: 'none',
+        codeExpiresAt: null,
+      };
+    }
+    const { code, expiresAt } = await this.codes.issue(postId, mode, digest);
+    if (mode === 'direct') {
+      const summary = codeMessage(code, preview, expiresAt);
+      if (summary === null) {
+        // Never ask the human to approve a view that leaves part of the post out.
+        this.codes.invalidate(postId);
+        this.audit.record(actor, 'draft.code_withheld', postId, { reason: 'summary_too_large' });
+        return {
+          ...preview,
+          warnings: [...preview.warnings, SUMMARY_TOO_LARGE_NOTICE],
+          codeDelivery: 'none',
+          codeExpiresAt: null,
+        };
+      }
       this.notifier.enqueue({
         event: 'confirmation_code',
         draftId: postId,
         code,
         expiresAt: new Date(expiresAt).toISOString(),
-        summary: codeMessage(code, preview, expiresAt),
+        summary,
         at: new Date().toISOString(),
       });
       this.audit.record(actor, 'draft.code_issued', postId, { delivery: 'direct' });
@@ -309,38 +361,56 @@ export class PostService {
         'This draft has expired (not confirmed within 24 h). Create a new draft.',
       );
     }
+    // `approved` is the digest of the content that was confirmed: the one the code was issued for,
+    // or for a trusted caller the content as it is now. Everything below works on that content,
+    // and the commit is refused if the draft no longer matches it.
+    let approved: string;
     if (!opts.trusted) {
       if (!opts.code) throw new PosterError('CODE_INVALID', 'A confirmation code is required.');
-      await this.codes.consume(row.id, opts.code);
+      approved = await this.codes.consume(row.id, opts.code, () => this.contentDigest(row.id));
     } else {
+      approved = this.contentDigest(row.id);
       this.codes.invalidate(row.id);
     }
+    // The row read at the top is stale after the awaits above.
+    const draft = this.getRow(draftId);
+    if (draft.status !== 'draft')
+      throw new PosterError('STATE_INVALID', `Post ${draft.id} is already ${draft.status}.`);
 
-    // Re-render with the current state and freeze the parts.
-    const rendered = await this.renderer.renderAll(this.renderInput(row));
+    // Re-render with the approved state and freeze the parts.
+    const rendered = await this.renderer.renderAll(this.renderInput(draft));
     const allIssues = rendered.flatMap((r) => r.issues);
     if (hasErrors(allIssues)) {
       const msgs = allIssues
         .filter((i) => i.level === 'error')
-        .map((i) => `${NETWORK_LABELS[i.network ?? (row.networks[0] as Network)]}: ${i.message}`);
+        .map((i) => `${NETWORK_LABELS[i.network ?? (draft.networks[0] as Network)]}: ${i.message}`);
       throw new PosterError('VALIDATION', `Draft cannot be published: ${msgs.join(' | ')}`, {
         extra: { issues: msgs },
       });
     }
 
-    this.enforceDailyLimit();
+    this.enforceDailyLimit(draft.id);
     const now = Date.now();
     const settings = this.settings.get();
     for (const r of rendered)
-      this.enforceMinGap(r.network, r.schedule.atUtcMs, row.id, settings.minGapPerNetworkMinutes);
+      this.enforceMinGap(r.network, r.schedule.atUtcMs, draft.id, settings.minGapPerNetworkMinutes);
 
     const immediate = rendered.every((r) => r.schedule.atUtcMs <= now + 60_000);
     const status: PostStatus = immediate ? 'queued' : 'scheduled';
     this.db.transaction((tx) => {
-      tx.update(posts)
+      if (this.contentDigest(draft.id) !== approved) {
+        throw new PosterError(
+          'STATE_INVALID',
+          'The draft changed while it was being confirmed. Ask for a new preview.',
+        );
+      }
+      const moved = tx
+        .update(posts)
         .set({ status, confirmedAt: now, updatedAt: now, expiresAt: null })
-        .where(eq(posts.id, row.id))
+        .where(and(eq(posts.id, draft.id), eq(posts.status, 'draft')))
         .run();
+      if (moved.changes !== 1)
+        throw new PosterError('STATE_INVALID', `Post ${draft.id} is no longer a draft.`);
       for (const r of rendered) {
         tx.update(postTargets)
           .set({
@@ -356,7 +426,7 @@ export class PostService {
           })
           .where(
             and(
-              eq(postTargets.postId, row.id),
+              eq(postTargets.postId, draft.id),
               eq(postTargets.network, r.network),
               notInArray(postTargets.status, ['published']),
             ),
@@ -378,11 +448,17 @@ export class PostService {
     };
   }
 
-  private enforceDailyLimit(): void {
+  /**
+   * The cap counts posts confirmed in the last 24 h plus posts that published something in that
+   * window. The second source is the attempts table, which only the scheduler writes: a post that
+   * an agent later turns back into a draft (reschedule_post clears confirmedAt) still counts.
+   */
+  private enforceDailyLimit(excludePostId?: string): void {
     const max = this.settings.get().maxPostsPerDay;
     const since = Date.now() - 24 * 3600_000;
-    const n = this.db
-      .select({ n: sql<number>`count(*)` })
+    const ids = new Set<string>();
+    for (const r of this.db
+      .select({ id: posts.id })
       .from(posts)
       .where(
         and(
@@ -390,11 +466,20 @@ export class PostService {
           notInArray(posts.status, ['draft', 'cancelled', 'expired']),
         ),
       )
-      .get()?.n;
-    if ((n ?? 0) >= max) {
+      .all())
+      ids.add(r.id);
+    for (const r of this.db
+      .select({ id: postTargets.postId })
+      .from(attemptsTable)
+      .innerJoin(postTargets, eq(postTargets.id, attemptsTable.targetId))
+      .where(and(eq(attemptsTable.outcome, 'published'), gte(attemptsTable.finishedAt, since)))
+      .all())
+      ids.add(r.id);
+    if (excludePostId) ids.delete(excludePostId);
+    if (ids.size >= max) {
       throw new PosterError(
         'RATE_LIMITED',
-        `Daily limit reached: ${n} post(s) confirmed in the last 24 h (max ${max}, see Settings).`,
+        `Daily limit reached: ${ids.size} post(s) confirmed or published in the last 24 h (max ${max}, see Settings).`,
         { retryable: false },
       );
     }
@@ -427,6 +512,27 @@ export class PostService {
       throw new PosterError(
         'SCHEDULE_INVALID',
         `${NETWORK_LABELS[network]}: another post (${clash.postId}) is scheduled within ${gapMinutes} min of this time.`,
+      );
+    }
+    // A post that has already published on this network no longer shows up above.
+    const recent = this.db
+      .select({ postId: postTargets.postId })
+      .from(attemptsTable)
+      .innerJoin(postTargets, eq(postTargets.id, attemptsTable.targetId))
+      .where(
+        and(
+          eq(postTargets.network, network),
+          ne(postTargets.postId, postId),
+          eq(attemptsTable.outcome, 'published'),
+          gte(attemptsTable.finishedAt, atUtcMs - gap),
+          lte(attemptsTable.finishedAt, atUtcMs + gap),
+        ),
+      )
+      .get();
+    if (recent) {
+      throw new PosterError(
+        'SCHEDULE_INVALID',
+        `${NETWORK_LABELS[network]}: another post (${recent.postId}) was published within ${gapMinutes} min of this time.`,
       );
     }
   }
@@ -521,6 +627,10 @@ export class PostService {
         'STATE_INVALID',
         'No target can be rescheduled (all published, cancelled or publishing).',
       );
+    // An operator rescheduling a post that was never confirmed is the confirmation, so the same
+    // limits apply as at confirm().
+    const confirmsNow = trusted && row.confirmedAt === null;
+    if (confirmsNow) this.enforceDailyLimit(row.id);
     if (trusted)
       for (const t of movable)
         this.enforceMinGap(
@@ -562,8 +672,12 @@ export class PostService {
         set.expiresAt = now + settings.draftExpiryHours * 3600_000;
       } else {
         set.status = resolved.immediate ? 'queued' : 'scheduled';
+        if (confirmsNow) set.confirmedAt = now;
       }
       tx.update(posts).set(set).where(eq(posts.id, row.id)).run();
+      // The post changed under any outstanding code: it approved the old schedule. The untrusted
+      // path issues a fresh one below.
+      this.codes.invalidate(row.id);
     });
     this.audit.record(actor, 'post.reschedule', row.id, {
       to: resolved.isoUtc,
@@ -579,7 +693,14 @@ export class PostService {
     return this.get(row.id);
   }
 
-  /** Re-queue failed / needs_auth / cancelled targets for an immediate attempt. */
+  /**
+   * Re-queue targets for another attempt.
+   *
+   * A script or agent may only re-queue failed, needs_auth and retrying targets of a post that was
+   * confirmed. Reviving a cancelled target, pulling a pending one forward, or running a post that
+   * was never confirmed is an operator decision (the UI), and it goes through the same daily cap
+   * and minimum gap as confirm() and is recorded as the confirmation.
+   */
   retry(
     postId: string,
     networks: Network[] | undefined,
@@ -587,15 +708,41 @@ export class PostService {
     opts: { now?: boolean } = {},
   ): PostView {
     const row = this.getRow(postId);
-    if (row.status === 'draft') throw new PosterError('STATE_INVALID', 'Confirm the draft first.');
+    const operator = actor === 'ui';
+    if (row.status === 'draft' || row.status === 'expired')
+      throw new PosterError(
+        'STATE_INVALID',
+        `Post ${row.id} is ${row.status}; confirm a draft first.`,
+      );
+    if (!operator && row.confirmedAt === null)
+      throw new PosterError(
+        'STATE_INVALID',
+        'Only a post that was confirmed with a code or by the operator can be retried.',
+      );
+    const retryable = operator
+      ? ['failed', 'needs_auth', 'retrying', 'cancelled', 'pending']
+      : ['failed', 'needs_auth', 'retrying'];
     const wanted = networks?.length ? new Set(networks) : null;
     const now = Date.now();
-    let n = 0;
-    for (const t of this.targets(row.id)) {
-      if (wanted && !wanted.has(t.network as Network)) continue;
-      if (!['failed', 'needs_auth', 'retrying', 'cancelled', 'pending'].includes(t.status))
-        continue;
-      if (t.status === 'pending' && !opts.now) continue;
+    const picked = this.targets(row.id).filter(
+      (t) =>
+        (!wanted || wanted.has(t.network as Network)) &&
+        retryable.includes(t.status) &&
+        !(t.status === 'pending' && !opts.now),
+    );
+    if (picked.length === 0) throw new PosterError('STATE_INVALID', 'No target to retry.');
+    if (operator && row.confirmedAt === null) {
+      this.enforceDailyLimit(row.id);
+      const gap = this.settings.get().minGapPerNetworkMinutes;
+      for (const t of picked)
+        this.enforceMinGap(t.network as Network, opts.now ? now : t.scheduledAtUtc, row.id, gap);
+      this.db
+        .update(posts)
+        .set({ confirmedAt: now, updatedAt: now })
+        .where(eq(posts.id, row.id))
+        .run();
+    }
+    for (const t of picked) {
       this.db
         .update(postTargets)
         .set({
@@ -616,9 +763,7 @@ export class PostService {
         network: t.network as Network,
         status: 'pending',
       });
-      n++;
     }
-    if (n === 0) throw new PosterError('STATE_INVALID', 'No target to retry.');
     const status = this.recomputePostStatus(row.id, opts.now ? 'queued' : 'scheduled');
     this.audit.record(actor, opts.now ? 'post.post_now' : 'post.retry', row.id, {
       networks: networks ?? 'all',
@@ -710,6 +855,45 @@ export class PostService {
       this.audit.record('system', 'draft.expire', r.id);
     }
     return rows.length;
+  }
+
+  /**
+   * SHA-256 over everything a confirmation code approves: text, thread mode, networks, per-network
+   * overrides, the schedule, and every attached file (by content hash) with its network, position
+   * and alt text. It is computed synchronously from the database, so two calls with no await
+   * between them always agree about whether the draft changed.
+   */
+  contentDigest(postId: string): string {
+    const row = this.getRow(postId);
+    const pm = this.db.select().from(postMedia).where(eq(postMedia.postId, postId)).all();
+    const infos = new Map(
+      this.media.getMany([...new Set(pm.map((m) => m.mediaId))]).map((i) => [i.id, i]),
+    );
+    const attachments = pm
+      .map((m) => ({
+        sha: infos.get(m.mediaId)?.sha256 ?? m.mediaId,
+        network: m.network ?? '',
+        position: m.position,
+        alt: m.altText ?? '',
+      }))
+      .sort((a, b) =>
+        a.network === b.network ? a.position - b.position : a.network < b.network ? -1 : 1,
+      );
+    return createHash('sha256')
+      .update(
+        stableStringify({
+          text: row.baseText,
+          thread: row.threadMode,
+          networks: [...(row.networks as string[])].sort(),
+          overrides: row.overrides,
+          at: row.scheduledAtUtc,
+          tz: row.tz,
+          local: row.localInput,
+          scheduleOverrides: row.scheduleOverrides,
+          attachments,
+        }),
+      )
+      .digest('hex');
   }
 
   getRow(postId: string): PostRow {
@@ -953,10 +1137,56 @@ function stripUndefined<T extends Record<string, unknown>>(obj: T): T {
   return out as T;
 }
 
-function codeMessage(code: string, preview: DraftPreview, expiresAt: number): string {
-  const nets = preview.previews.map((p) => NETWORK_LABELS[p.network]).join(', ');
-  const first = preview.previews[0]?.parts[0]?.text ?? '';
-  const excerpt = first.length > 80 ? `${first.slice(0, 77)}…` : first;
+const NO_CODE_ROUTE_NOTICE =
+  'No confirmation code was issued: no direct Hermes route is configured and soft mode is off, so a code cannot reach the user outside the agent. Ask the user to confirm this draft in the web UI.';
+const SUMMARY_TOO_LARGE_NOTICE =
+  'No confirmation code was issued: this draft is too large to show in full in a chat message, and a code must never approve a partial view. Ask the user to review and confirm it in the web UI.';
+
+/** Stay well under the chat transport's per-message limit. */
+const OOB_MESSAGE_MAX_CHARS = 3500;
+/** U+2028, U+2029 and format characters (bidi controls, zero-width) survive JSON.stringify. */
+const UNSAFE_CHARS = /[\u2028\u2029\p{Cf}]/gu;
+
+/** Quote agent-controlled text so quotes, backslashes, newlines and invisible characters cannot forge lines. */
+function quoteUntrusted(s: string): string {
+  return JSON.stringify(s).replace(UNSAFE_CHARS, (c) => `\\u{${c.codePointAt(0)!.toString(16)}}`);
+}
+
+/**
+ * The out-of-band approval message: the complete record of what the code will publish, with
+ * every agent-controlled string escaped. Returns null when it does not fit in one message; the
+ * caller must then not ask for approval over chat.
+ */
+function codeMessage(code: string, preview: DraftPreview, expiresAt: number): string | null {
   const minutes = Math.max(1, Math.round((expiresAt - Date.now()) / 60_000));
-  return `Confirmation code for the post to ${nets} at ${preview.schedule.display}: ${code}\n"${excerpt}"\nReply "yes ${code}" to Hermes to publish, or "cancel". The code expires in ${minutes} min.`;
+  const lines = [`Confirmation code ${code}, expires in ${minutes} min.`];
+  for (const n of preview.previews) {
+    lines.push(`${NETWORK_LABELS[n.network]} at ${n.schedule.display}:`);
+    n.parts.forEach((p, i) => {
+      lines.push(
+        `  ${n.parts.length > 1 ? `${i + 1}/${n.parts.length} ` : ''}${quoteUntrusted(p.text)}`,
+      );
+      if (p.media.length)
+        lines.push(
+          `  media: ${p.media.map((m) => `${m.kind} ${m.id} alt=${quoteUntrusted(m.altText ?? '')}`).join(', ')}`,
+        );
+    });
+  }
+  lines.push(`Reply "yes ${code}" to Hermes to publish, or "cancel".`);
+  const message = lines.join('\n');
+  return message.length <= OOB_MESSAGE_MAX_CHARS ? message : null;
+}
+
+/** JSON.stringify with sorted object keys, so equal values always give equal strings. */
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const o = value as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .sort()
+      .filter((k) => o[k] !== undefined)
+      .map((k) => `${JSON.stringify(k)}:${stableStringify(o[k])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
 }

@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, lt, lte, or, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from 'drizzle-orm';
 import {
   formatInZone,
   isTransientNetworkError,
@@ -146,6 +146,8 @@ export class Scheduler {
         and(
           inArray(postTargets.status, ['pending', 'retrying']),
           inArray(posts.status, RUNNABLE_POST_STATUSES),
+          // Defence in depth: a post that was never confirmed (code or operator) never runs.
+          isNotNull(posts.confirmedAt),
           lte(postTargets.scheduledAtUtc, now),
           or(isNull(postTargets.nextAttemptAt), lte(postTargets.nextAttemptAt, now)),
           or(isNull(postTargets.leaseUntil), lt(postTargets.leaseUntil, now)),
@@ -191,6 +193,7 @@ export class Scheduler {
         and(
           eq(postTargets.status, 'pending'),
           inArray(posts.status, RUNNABLE_POST_STATUSES),
+          isNotNull(posts.confirmedAt),
           eq(postTargets.attempts, 0),
           isNull(postTargets.nextAttemptAt),
           lt(postTargets.scheduledAtUtc, now - windowMs),

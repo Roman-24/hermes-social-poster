@@ -1,0 +1,1 @@
+ALTER TABLE `drafts_codes` ADD `content_digest` text DEFAULT '' NOT NULL;

@@ -1,6 +1,14 @@
+import argon2 from 'argon2';
+import { and, eq, isNull } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
 import type { DraftPreview } from '@poster/core';
+import {
+  draftCodes,
+  notifications as notificationsTable,
+  posts,
+  postTargets,
+} from './db/schema.js';
 import { createTestEnv, HOST, type TestEnv } from './test-helpers.js';
 
 /**
@@ -95,5 +103,356 @@ describe('input bounds (bounded draft inputs, linear parsing)', () => {
     );
     expect(Date.now() - t0).toBeLessThan(2_000);
     expect(preview.previews.length).toBe(3);
+  });
+});
+
+/** A bearer-token client for the REST API (what a script holding a spa_ token can do). */
+function tokenClient(token: string) {
+  return {
+    async call<T>(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: string, payload?: unknown) {
+      const res = await env.app.inject({
+        method,
+        url,
+        payload,
+        headers: { ...HOST, authorization: `Bearer ${token}` },
+      });
+      return { status: res.statusCode, body: res.json() as T & { code?: string } };
+    },
+  };
+}
+
+const inDays = (n: number) => new Date(Date.now() + n * 86_400_000).toISOString();
+
+const liveCodes = (draftId: string) =>
+  env.services.db
+    .select()
+    .from(draftCodes)
+    .where(and(eq(draftCodes.draftId, draftId), isNull(draftCodes.usedAt)))
+    .all();
+
+describe('retry and post-now keep their provenance (write token cannot publish unconfirmed drafts)', () => {
+  it('refuses cancel then post-now for a script token and publishes nothing', async () => {
+    const token = env.services.auth.rotateToken('api', 'write');
+    const t = tokenClient(token);
+    const d = await t.call<DraftPreview>('POST', '/api/v1/drafts', {
+      text: 'never confirmed',
+      networks: ['nostr'],
+    });
+    expect(d.status).toBe(200);
+    const id = d.body.draftId;
+    expect((await t.call('POST', `/api/v1/posts/${id}/cancel`, {})).status).toBe(200);
+    const postNow = await t.call('POST', `/api/v1/posts/${id}/post-now`, {});
+    expect(postNow.status).toBe(409);
+    expect(postNow.body.code).toBe('STATE_INVALID');
+    const retry = await t.call('POST', `/api/v1/posts/${id}/retry`, {});
+    expect(retry.status).toBe(409);
+    await env.services.scheduler.tick(Date.now() + 5_000);
+    expect(env.fakes.nostr.published).toHaveLength(0);
+    expect(env.services.posts.getRow(id).confirmedAt).toBeNull();
+  });
+
+  it('refuses post-now for an expired draft, even for the operator', async () => {
+    const d = await env.services.posts.createDraft({ text: 'old', networks: ['nostr'] }, 'ui');
+    env.services.posts.expireDrafts(Date.now() + 25 * 3600_000);
+    expect(() => env.services.posts.postNow(d.draftId, undefined, 'api')).toThrow(/expired/);
+    expect(() => env.services.posts.postNow(d.draftId, undefined, 'ui')).toThrow(/expired/);
+  });
+
+  it('does not let a script token pull a scheduled post forward or revive a cancelled one', async () => {
+    const d = await env.services.posts.createDraft(
+      { text: 'later', networks: ['nostr'], schedule: inDays(30) },
+      'ui',
+    );
+    await env.services.posts.confirm(d.draftId, { trusted: true, actor: 'ui' });
+    expect(() => env.services.posts.postNow(d.draftId, undefined, 'api')).toThrow(
+      /No target to retry/,
+    );
+    env.services.posts.cancel({ postId: d.draftId }, 'ui');
+    expect(() => env.services.posts.retry(d.draftId, undefined, 'api')).toThrow(
+      /No target to retry/,
+    );
+    // The operator may revive it.
+    const revived = env.services.posts.postNow(d.draftId, undefined, 'ui');
+    expect(revived.targets[0]?.status).toBe('pending');
+  });
+
+  it('still lets a script token retry a failed target of a confirmed post', async () => {
+    env.fakes.nostr.options.failWith = 'AUTH_REQUIRED';
+    const d = await env.services.posts.createDraft({ text: 'flaky', networks: ['nostr'] }, 'ui');
+    await env.services.posts.confirm(d.draftId, { trusted: true, actor: 'ui' });
+    await env.services.scheduler.tick();
+    await vi.waitFor(() =>
+      expect(env.services.posts.get(d.draftId).targets[0]?.status).toBe('needs_auth'),
+    );
+    env.fakes.nostr.options.failWith = null;
+    const view = env.services.posts.retry(d.draftId, undefined, 'api');
+    expect(view.targets[0]?.status).toBe('pending');
+  });
+
+  it('applies the daily cap and records the confirmation when the operator revives a never-confirmed post', async () => {
+    env.services.settings.update({ maxPostsPerDay: 1 });
+    const first = await env.services.posts.createDraft({ text: 'one', networks: ['x'] }, 'ui');
+    await env.services.posts.confirm(first.draftId, { trusted: true, actor: 'ui' });
+    const d = await env.services.posts.createDraft({ text: 'two', networks: ['nostr'] }, 'ui');
+    env.services.posts.cancel({ postId: d.draftId }, 'ui');
+    expect(() => env.services.posts.postNow(d.draftId, undefined, 'ui')).toThrow(/Daily limit/);
+    env.services.settings.update({ maxPostsPerDay: 5 });
+    env.services.posts.postNow(d.draftId, undefined, 'ui');
+    expect(env.services.posts.getRow(d.draftId).confirmedAt).not.toBeNull();
+  });
+
+  it('records the confirmation when the operator reschedules a draft, and the scheduler publishes it', async () => {
+    const d = await env.services.posts.createDraft(
+      { text: 'rescheduled', networks: ['nostr'] },
+      'ui',
+    );
+    await env.services.posts.reschedule(d.draftId, 'now', undefined, 'ui', true);
+    expect(env.services.posts.getRow(d.draftId).confirmedAt).not.toBeNull();
+    await env.services.scheduler.tick();
+    await vi.waitFor(() => expect(env.fakes.nostr.published).toHaveLength(1));
+  });
+
+  it('never runs a post that has no recorded confirmation', async () => {
+    const d = await env.services.posts.createDraft({ text: 'sneaky', networks: ['nostr'] }, 'ui');
+    // Force the unsafe state directly: runnable status, no confirmation.
+    env.services.db
+      .update(posts)
+      .set({ status: 'queued', confirmedAt: null })
+      .where(eq(posts.id, d.draftId))
+      .run();
+    env.services.db
+      .update(postTargets)
+      .set({ scheduledAtUtc: Date.now() - 1000 })
+      .where(eq(postTargets.postId, d.draftId))
+      .run();
+    await env.services.scheduler.tick(Date.now() + 5_000);
+    expect(env.fakes.nostr.published).toHaveLength(0);
+  });
+});
+
+describe('a confirmation code approves exactly the content it was issued for', () => {
+  it('rejects a confirm that is verifying while update_draft changes the draft', async () => {
+    const d = await env.services.posts.createDraft(
+      { text: 'approved text', networks: ['x'] },
+      'mcp',
+    );
+    const confirm = env.services.posts.confirm(d.draftId, {
+      trusted: false,
+      code: d.code!,
+      actor: 'mcp',
+    });
+    // The confirm is now awaiting the argon2 check; the update lands in that window.
+    const update = env.services.posts.updateDraft(
+      { draftId: d.draftId, text: 'UNAPPROVED replacement' },
+      'mcp',
+    );
+    await expect(confirm).rejects.toMatchObject({ code: 'CODE_EXPIRED' });
+    await update;
+    expect(env.services.posts.getRow(d.draftId).status).toBe('draft');
+    await env.services.scheduler.tick(Date.now() + 5_000);
+    expect(env.fakes.x.published).toHaveLength(0);
+  });
+
+  it('rejects a confirm that races an update which swaps in new media', async () => {
+    const m = await env.services.media.ingestBuffer(await png());
+    const d = await env.services.posts.createDraft({ text: 'plain post', networks: ['x'] }, 'mcp');
+    const update = env.services.posts.updateDraft({ draftId: d.draftId, mediaIds: [m.id] }, 'mcp');
+    const confirm = env.services.posts.confirm(d.draftId, {
+      trusted: false,
+      code: d.code!,
+      actor: 'mcp',
+    });
+    await expect(confirm).rejects.toMatchObject({ code: expect.stringMatching(/CODE_/) });
+    await update;
+    expect(env.services.posts.getRow(d.draftId).status).toBe('draft');
+    expect(env.fakes.x.published).toHaveLength(0);
+  });
+
+  it('rejects a code whose draft content changed without the code being invalidated', async () => {
+    const d = await env.services.posts.createDraft({ text: 'before', networks: ['x'] }, 'mcp');
+    // Simulate any path that edits the draft but forgets to invalidate: the digest still catches it.
+    env.services.db.update(posts).set({ baseText: 'after' }).where(eq(posts.id, d.draftId)).run();
+    await expect(
+      env.services.posts.confirm(d.draftId, { trusted: false, code: d.code!, actor: 'mcp' }),
+    ).rejects.toMatchObject({ code: 'CODE_EXPIRED' });
+    expect(env.services.posts.getRow(d.draftId).status).toBe('draft');
+  });
+
+  it('keeps exactly one live code when two updates overlap, and that code confirms the final text', async () => {
+    const d = await env.services.posts.createDraft({ text: 'start', networks: ['x'] }, 'mcp');
+    const [a, b] = await Promise.all([
+      env.services.posts.updateDraft({ draftId: d.draftId, text: 'version one' }, 'mcp'),
+      env.services.posts.updateDraft({ draftId: d.draftId, text: 'version two' }, 'mcp'),
+    ]);
+    expect(liveCodes(d.draftId)).toHaveLength(1);
+    const final = env.services.posts.getRow(d.draftId).baseText;
+    const code = (final === 'version one' ? a : b).code ?? a.code ?? b.code;
+    const live = [a.code, b.code].filter(Boolean);
+    expect(live.length).toBeGreaterThan(0);
+    let confirmed = false;
+    for (const c of live) {
+      try {
+        await env.services.posts.confirm(d.draftId, { trusted: false, code: c!, actor: 'mcp' });
+        confirmed = true;
+        break;
+      } catch {
+        /* the earlier code was invalidated */
+      }
+    }
+    expect(code).toBeDefined();
+    expect(confirmed).toBe(true);
+    await env.services.scheduler.tick();
+    await vi.waitFor(() => expect(env.fakes.x.published).toHaveLength(1));
+    expect(env.fakes.x.published[0]?.post.parts[0]?.text).toBe(final);
+  });
+});
+
+describe('the five-attempt limit holds under concurrency', () => {
+  it('verifies at most five guesses however many arrive together, and consumes a code once', async () => {
+    const verify = vi.spyOn(argon2, 'verify');
+    const d = await env.services.posts.createDraft({ text: 'guess me', networks: ['x'] }, 'mcp');
+    const guesses = Array.from({ length: 40 }, (_, i) => `WRONG${String(i).padStart(2, '0')}`);
+    const results = await Promise.allSettled(
+      guesses.map((g) =>
+        env.services.posts.confirm(d.draftId, { trusted: false, code: g, actor: 'mcp' }),
+      ),
+    );
+    expect(results.every((r) => r.status === 'rejected')).toBe(true);
+    expect(verify.mock.calls.length).toBeLessThanOrEqual(10);
+    // The code is dead now, genuine or not.
+    await expect(
+      env.services.posts.confirm(d.draftId, { trusted: false, code: d.code!, actor: 'mcp' }),
+    ).rejects.toMatchObject({ code: expect.stringMatching(/CODE_/) });
+    verify.mockRestore();
+  });
+
+  it('lets exactly one of several concurrent confirms with the genuine code through', async () => {
+    const d = await env.services.posts.createDraft({ text: 'once', networks: ['x'] }, 'mcp');
+    const results = await Promise.allSettled(
+      [1, 2, 3].map(() =>
+        env.services.posts.confirm(d.draftId, { trusted: false, code: d.code!, actor: 'mcp' }),
+      ),
+    );
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    await env.services.scheduler.tick();
+    await vi.waitFor(() => expect(env.fakes.x.published).toHaveLength(1));
+  });
+});
+
+describe('the daily cap and the gap come from durable publication records', () => {
+  it('still counts a post that published and was then turned back into a draft by reschedule_post', async () => {
+    env.services.settings.update({ maxPostsPerDay: 2 });
+    const p1 = await env.services.posts.createDraft({ text: 'first', networks: ['nostr'] }, 'ui');
+    await env.services.posts.confirm(p1.draftId, { trusted: true, actor: 'ui' });
+    await env.services.scheduler.tick();
+    await vi.waitFor(() => expect(env.fakes.nostr.published).toHaveLength(1));
+
+    env.fakes.x.options.failWith = 'AUTH_REQUIRED';
+    const p2 = await env.services.posts.createDraft(
+      { text: 'second', networks: ['bluesky', 'x'] },
+      'ui',
+    );
+    await env.services.posts.confirm(p2.draftId, { trusted: true, actor: 'ui' });
+    await env.services.scheduler.tick();
+    await vi.waitFor(() =>
+      expect(env.services.posts.get(p2.draftId).status).toBe('partially_published'),
+    );
+    const p3 = await env.services.posts.createDraft(
+      { text: 'third', networks: ['linkedin'] },
+      'ui',
+    );
+    await expect(
+      env.services.posts.confirm(p3.draftId, { trusted: true, actor: 'ui' }),
+    ).rejects.toMatchObject({ code: 'RATE_LIMITED' });
+
+    // The agent turns the partly published post back into a draft; the cap must not forget it.
+    await env.services.posts.reschedule(p2.draftId, inDays(30), undefined, 'mcp', false);
+    expect(env.services.posts.getRow(p2.draftId).confirmedAt).toBeNull();
+    await expect(
+      env.services.posts.confirm(p3.draftId, { trusted: true, actor: 'ui' }),
+    ).rejects.toMatchObject({ code: 'RATE_LIMITED' });
+  });
+
+  it('applies the minimum gap to a post that has already published on the same network', async () => {
+    env.services.settings.update({ minGapPerNetworkMinutes: 30 });
+    const a = await env.services.posts.createDraft({ text: 'a', networks: ['nostr'] }, 'ui');
+    await env.services.posts.confirm(a.draftId, { trusted: true, actor: 'ui' });
+    await env.services.scheduler.tick();
+    await vi.waitFor(() => expect(env.fakes.nostr.published).toHaveLength(1));
+    const b = await env.services.posts.createDraft({ text: 'b', networks: ['nostr'] }, 'ui');
+    await expect(
+      env.services.posts.confirm(b.draftId, { trusted: true, actor: 'ui' }),
+    ).rejects.toMatchObject({ code: 'SCHEDULE_INVALID' });
+  });
+});
+
+describe('the out-of-band approval message shows everything and escapes agent text', () => {
+  const directMode = () =>
+    env.services.settings.update({
+      hermes: { webhookBaseUrl: 'http://hermes.test:8644', directRoute: 'poster-direct' },
+    });
+  const message = () =>
+    (env.services.db.select().from(notificationsTable).all().at(-1)?.payload as { message: string })
+      .message;
+
+  it('includes every network, every part and the media, and quotes hostile text', async () => {
+    directMode();
+    const m = await env.services.media.ingestBuffer(await png());
+    const d = await env.services.posts.createDraft(
+      {
+        text: 'Intro that is fine.\n---\nSECOND PART visit http://evil.example/p2',
+        networks: ['bluesky', 'x'],
+        overrides: { x: { text: 'X only: http://evil.example/x' } },
+        mediaIds: [m.id],
+        altTexts: ['a "quoted"\nalt'],
+      },
+      'mcp',
+    );
+    expect(d.codeDelivery).toBe('direct');
+    const msg = message();
+    expect(msg).toContain('SECOND PART visit http://evil.example/p2');
+    expect(msg).toContain('X only: http://evil.example/x');
+    expect(msg).toContain(m.id);
+    // Quotes and newlines in agent text cannot add lines to the trusted message.
+    expect(msg).toContain('alt="a \\"quoted\\"\\nalt"');
+    const lines = msg.split('\n');
+    expect(lines.filter((l) => l.startsWith('Reply "yes'))).toHaveLength(1);
+  });
+
+  it('withholds the code when the message cannot show the whole post', async () => {
+    directMode();
+    const d = await env.services.posts.createDraft(
+      { text: 'word '.repeat(600).trim(), networks: ['x', 'bluesky'] },
+      'mcp',
+    );
+    expect(d.codeDelivery).toBe('none');
+    expect(d.warnings.join(' ')).toMatch(/too large to show in full/);
+    expect(liveCodes(d.draftId)).toHaveLength(0);
+  });
+});
+
+describe('without a direct route the code stays out of the agent unless soft mode is switched on', () => {
+  it('issues no code to the agent by default', async () => {
+    await env.cleanup();
+    env = await createTestEnv({ softMode: false });
+    const d = await env.services.posts.createDraft({ text: 'ui only', networks: ['x'] }, 'mcp');
+    expect(d.codeDelivery).toBe('none');
+    expect(d.code).toBeUndefined();
+    expect(d.warnings.join(' ')).toMatch(/confirm this draft in the web UI/);
+    expect(liveCodes(d.draftId)).toHaveLength(0);
+    await expect(
+      env.services.posts.confirm(d.draftId, { trusted: false, code: 'ABCDEF', actor: 'mcp' }),
+    ).rejects.toMatchObject({ code: 'CODE_EXPIRED' });
+    expect(env.services.notifier.codeDeliveryMode()).toBe('none');
+    // The operator can still confirm in the UI.
+    const r = await env.services.posts.confirm(d.draftId, { trusted: true, actor: 'ui' });
+    expect(r.status).toBe('queued');
+  });
+
+  it('returns the code only after the operator opted in', async () => {
+    env.services.settings.update({ hermes: { allowSoftMode: true } });
+    const d = await env.services.posts.createDraft({ text: 'soft', networks: ['x'] }, 'mcp');
+    expect(d.codeDelivery).toBe('returned');
+    expect(d.code).toMatch(/^[A-Z2-9]{6}$/);
   });
 });

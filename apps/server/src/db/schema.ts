@@ -151,6 +151,8 @@ export const draftCodes = sqliteTable(
       .notNull()
       .references(() => posts.id, { onDelete: 'cascade' }),
     codeHash: text('code_hash').notNull(), // argon2id
+    /** SHA-256 of the draft content the code was issued for; a code only confirms that content. */
+    contentDigest: text('content_digest').notNull().default(''),
     expiresAt: integer('expires_at').notNull(),
     deliveredVia: text('delivered_via').notNull(), // direct | returned | none
     failedAttempts: integer('failed_attempts').notNull().default(0),

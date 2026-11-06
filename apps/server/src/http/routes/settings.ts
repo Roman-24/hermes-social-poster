@@ -138,7 +138,7 @@ export async function settingsRoutes(
     uptimeMs: Date.now() - startedAt,
     now: new Date().toISOString(),
     tz: settings.get().defaultTz,
-    codeDelivery: notifier.directRouteConfigured() ? 'direct' : 'returned',
+    codeDelivery: notifier.codeDeliveryMode(),
     fakeAdapters: config.fakeAdapters,
     scheduler: {
       lastTickAt: scheduler.lastTickAt,

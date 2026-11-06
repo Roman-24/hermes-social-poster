@@ -24,7 +24,7 @@ export interface TestEnv {
 }
 
 export async function createTestEnv(
-  opts: { env?: Record<string, string>; webhookStatus?: number } = {},
+  opts: { env?: Record<string, string>; webhookStatus?: number; softMode?: boolean } = {},
 ): Promise<TestEnv> {
   const dataDir = mkdtempSync(join(tmpdir(), 'poster-data-'));
   const inboxDir = mkdtempSync(join(tmpdir(), 'poster-inbox-'));
@@ -59,6 +59,10 @@ export async function createTestEnv(
     adapters: fakes as unknown as AdapterRegistry,
     fetchImpl,
   });
+  // Soft mode (the code is returned to the caller) is off by default in production; most tests
+  // need the code in the tool result, so they switch it on here. Pass softMode: false to test the
+  // default.
+  services.settings.update({ hermes: { allowSoftMode: opts.softMode ?? true } });
   const app = await buildApp(services);
   await app.ready();
 

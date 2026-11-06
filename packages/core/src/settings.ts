@@ -80,6 +80,13 @@ export const SettingsSchema = z.object({
       signatureHeader: z.string().default('X-Webhook-Signature'),
       /** "hex" → raw hex digest; "sha256=" → "sha256=<hex>" */
       signaturePrefix: z.string().default('sha256='),
+      /**
+       * Soft mode. Without a direct route the confirmation code cannot reach you outside the
+       * agent. When this is true the code is returned to the agent in the tool result, so the
+       * agent can confirm posts on its own. Off by default: with no direct route, drafts can only
+       * be confirmed in the UI.
+       */
+      allowSoftMode: z.boolean().default(false),
     })
     .default({
       webhookBaseUrl: null,
@@ -87,6 +94,7 @@ export const SettingsSchema = z.object({
       agentRoute: null,
       signatureHeader: 'X-Webhook-Signature',
       signaturePrefix: 'sha256=',
+      allowSoftMode: false,
     }),
   selfTest: z
     .object({

@@ -18,7 +18,7 @@ async function main(): Promise<void> {
       dataDir: config.DATA_DIR,
       inbox: config.INBOX_DIR,
       fakeAdapters: config.fakeAdapters,
-      codeDelivery: services.notifier.directRouteConfigured() ? 'direct' : 'returned (soft mode)',
+      codeDelivery: services.notifier.codeDeliveryMode(),
     },
     'social poster listening',
   );

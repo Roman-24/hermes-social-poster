@@ -35,6 +35,17 @@ export class Notifier {
     return !!s.webhookBaseUrl && !!s.directRoute;
   }
 
+  /**
+   * How a confirmation code reaches the human:
+   * - direct: through the deliver_only route, never through the agent
+   * - returned: soft mode, handed to the agent (only when the operator switched it on)
+   * - none: no direct route and soft mode is off, so only the UI can confirm
+   */
+  codeDeliveryMode(): 'direct' | 'returned' | 'none' {
+    if (this.directRouteConfigured()) return 'direct';
+    return this.settings.get().hermes.allowSoftMode ? 'returned' : 'none';
+  }
+
   /** Queue an event. Returns the notification id, or null if no webhook is configured. */
   enqueue(event: WebhookEvent, routeKind: 'direct' | 'agent' = 'direct'): string | null {
     const h = this.settings.get().hermes;

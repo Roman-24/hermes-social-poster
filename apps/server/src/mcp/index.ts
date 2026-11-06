@@ -22,7 +22,8 @@ import type { AuthHooks } from '../http/auth-hooks.js';
 
 const PREAMBLE =
   'Always show the user the FULL preview (every network, every part, the resolved time in their zone and in UTC, and all warnings). ' +
-  'Never invent, guess or reuse a confirmation code: the code reaches the user directly in SimpleX and only they can give it to you. ' +
+  'Never invent, guess or reuse a confirmation code: the code is sent to the user directly in SimpleX and only they can give it to you. ' +
+  'If a draft says no code was issued, tell the user to confirm it in the web UI; do not look for another way to confirm. ' +
   'Pass times with an explicit zone ("2026-11-02T09:00:00+01:00" or {at, tz}); the default zone is the user\'s configured zone.';
 
 /**
@@ -345,7 +346,12 @@ export function renderPreview(p: DraftPreview): string {
     lines.push(
       `Confirmation code (soft mode, no direct Hermes route configured): ${p.code}. Show the preview and ask the user to confirm with this code.`,
     );
-  else lines.push('No code issued (draft has errors). Fix them with update_draft.');
+  else if (p.errors.length)
+    lines.push('No code issued (draft has errors). Fix them with update_draft.');
+  else
+    lines.push(
+      'No confirmation code was issued for this draft. Tell the user to review and confirm it in the web UI.',
+    );
   if (p.codeExpiresAt) lines.push(`Code expires at ${new Date(p.codeExpiresAt).toISOString()}.`);
   return lines.join('\n');
 }

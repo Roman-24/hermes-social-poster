@@ -387,6 +387,21 @@ export function SettingsPage() {
                 onChange={(e) => set('hermesWebhookSecret', e.target.value)}
               />
             </Field>
+            <div className="flex items-start justify-between gap-3 rounded-md border border-border p-3">
+              <div>
+                <div className="text-sm font-medium">Soft mode: return codes to the agent</div>
+                <div className="text-xs text-muted">
+                  Only used when no direct route is configured. The agent then receives the
+                  confirmation code and can confirm posts without you. Leave this off and confirm
+                  drafts here instead.
+                </div>
+              </div>
+              <Switch
+                checked={f.hermes.allowSoftMode}
+                onCheckedChange={(v) => set('hermes', { ...f.hermes, allowSoftMode: v })}
+                aria-label="Soft mode"
+              />
+            </div>
             <div>
               <Button
                 variant="outline"
@@ -867,7 +882,13 @@ function SystemCard() {
           <div className="flex flex-col gap-2">
             {s.codeDelivery === 'returned' ? (
               <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-warning">
-                No direct Hermes route configured: codes are returned to the agent (soft mode).
+                No direct Hermes route configured and soft mode is on: codes are returned to the
+                agent, which can confirm posts without you.
+              </div>
+            ) : s.codeDelivery === 'none' ? (
+              <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-warning">
+                No direct Hermes route configured: no confirmation code is sent to the agent, so
+                drafts can only be confirmed here in the UI.
               </div>
             ) : (
               <div className="rounded-md border border-success/40 bg-success/10 p-2 text-success">

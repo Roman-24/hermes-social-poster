@@ -91,7 +91,6 @@ describe('splitThread', () => {
   });
 });
 
-
 describe('manual separators', () => {
   it('detects and splits on lines holding only ---', () => {
     expect(hasManualBreaks('a\n---\nb')).toBe(true);
