@@ -1,6 +1,9 @@
 import argon2 from 'argon2';
-import { existsSync } from 'node:fs';
+import { closeSync, existsSync, ftruncateSync, openSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import * as OTPAuth from 'otpauth';
 import { and, eq, isNull } from 'drizzle-orm';
+import type { WebSocket as WsSocket } from 'ws';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
 import { newId, type DraftPreview } from '@poster/core';
@@ -11,6 +14,7 @@ import {
   posts,
   postTargets,
 } from './db/schema.js';
+import { loadConfig } from './config.js';
 import { nullLogger } from './logger.js';
 import { Notifier } from './services/notifier.js';
 import { createTestEnv, HOST, type TestEnv } from './test-helpers.js';
@@ -663,5 +667,143 @@ describe('media retention does not delete files another row still uses', () => {
     env.services.jobs.runRetention();
     expect(row(b.id).purgedAt).not.toBeNull();
     expect(existsSync(original)).toBe(false);
+  });
+});
+
+describe('the second factor cannot be replaced with a session alone', () => {
+  const codeFor = (secret: string) =>
+    new OTPAuth.TOTP({
+      secret: OTPAuth.Secret.fromBase32(secret),
+      algorithm: 'SHA1',
+      digits: 6,
+      period: 30,
+    }).generate();
+
+  it('refuses setup and enable while TOTP is active, and disabling needs a current code', async () => {
+    const c = await ui();
+    const first = await c.call<{ secret: string }>('POST', '/api/v1/auth/totp/setup', {});
+    expect(first.status).toBe(200);
+    const enabled = await c.call('POST', '/api/v1/auth/totp/enable', {
+      code: codeFor(first.body.secret),
+    });
+    expect(enabled.status).toBe(200);
+
+    // The attacker's route: enrol a secret of their own, enable it, then disable with its code.
+    const again = await c.call<{ code?: string }>('POST', '/api/v1/auth/totp/setup', {});
+    expect(again.status).toBe(409);
+    const enableAgain = await c.call('POST', '/api/v1/auth/totp/enable', { code: '123456' });
+    expect(enableAgain.status).toBe(409);
+    expect(env.services.auth.totpEnabled()).toBe(true);
+    expect(env.services.settings.getSecret('ui.totpSecret')).toBe(first.body.secret);
+
+    const wrong = await c.call('DELETE', '/api/v1/auth/totp', { code: '000000' });
+    expect(wrong.status).toBe(401);
+    const disabled = await c.call('DELETE', '/api/v1/auth/totp', {
+      code: codeFor(first.body.secret),
+    });
+    expect(disabled.status).toBe(200);
+    expect(env.services.auth.totpEnabled()).toBe(false);
+    // After a proper disable, enrolling again works and no stale pending secret is left behind.
+    expect(env.services.settings.hasSecret('ui.totpPending')).toBe(false);
+    const fresh = await c.call<{ secret: string }>('POST', '/api/v1/auth/totp/setup', {});
+    expect(fresh.status).toBe(200);
+  });
+});
+
+describe('WebSockets', () => {
+  async function connect(path: string, headers: Record<string, string>): Promise<WsSocket> {
+    const auth = await env.login();
+    return env.app.injectWS(path, { headers: { ...HOST, cookie: auth.cookie, ...headers } });
+  }
+
+  it('rejects a cross-origin upgrade even with a valid cookie, and accepts the same origin', async () => {
+    await expect(connect('/ws/events', { origin: 'https://attacker.example' })).rejects.toThrow(
+      /403/,
+    );
+    await expect(connect('/ws/events', { origin: 'null' })).rejects.toThrow(/403/);
+    const ws = await connect('/ws/events', { origin: 'http://127.0.0.1:8787' });
+    expect(ws.readyState).toBe(ws.OPEN);
+    ws.close();
+  });
+
+  it('closes an open events socket once its session is gone and delivers nothing more', async () => {
+    const auth = await env.login();
+    const ws = await env.app.injectWS('/ws/events', {
+      headers: { ...HOST, cookie: auth.cookie },
+    });
+    const received: string[] = [];
+    ws.on('message', (m) => received.push(m.toString()));
+    const closed = new Promise<number>((r) => ws.on('close', (code) => r(code)));
+
+    env.services.events.emit({ type: 'post.updated', postId: 'p1', status: 'draft' });
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+
+    // Logout deletes the session row. The next event must not reach the socket.
+    const out = await env.app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/logout',
+      headers: { ...HOST, cookie: auth.cookie, 'x-csrf-token': auth.csrf },
+    });
+    expect(out.statusCode).toBeLessThan(300);
+    env.services.events.emit({ type: 'post.updated', postId: 'p2', status: 'draft' });
+    expect(await closed).toBe(4401);
+    expect(received).toHaveLength(1);
+  });
+
+  it('drops client input on a browser socket after the session ended', async () => {
+    const auth = await env.login();
+    const handle = vi.spyOn(env.services.browserSessions, 'handle').mockResolvedValue(undefined);
+    vi.spyOn(env.services.browserSessions, 'subscribe').mockReturnValue(() => {});
+    const ws = await env.app.injectWS('/ws/browser/s1', {
+      headers: { ...HOST, cookie: auth.cookie },
+    });
+    const closed = new Promise<number>((r) => ws.on('close', (code) => r(code)));
+    ws.send(JSON.stringify({ type: 'mouse', event: 'mouseMoved', x: 1, y: 1 }));
+    await vi.waitFor(() => expect(handle).toHaveBeenCalledTimes(1));
+
+    env.services.auth.revokeAllSessions();
+    ws.send(JSON.stringify({ type: 'text', text: 'typed after revocation' }));
+    expect(await closed).toBe(4401);
+    expect(handle).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TRUST_PROXY is a real boolean', () => {
+  const env0 = { DATA_DIR: '/tmp/poster-config-test' };
+  it('treats "false" and "0" as off, "1" and "true" as on, and rejects anything else', () => {
+    expect(loadConfig({ ...env0, TRUST_PROXY: 'false' }).TRUST_PROXY).toBe(false);
+    expect(loadConfig({ ...env0, TRUST_PROXY: '0' }).TRUST_PROXY).toBe(false);
+    expect(loadConfig({ ...env0 }).TRUST_PROXY).toBeUndefined();
+    expect(loadConfig({ ...env0, TRUST_PROXY: '1' }).TRUST_PROXY).toBe(true);
+    expect(loadConfig({ ...env0, TRUST_PROXY: 'TRUE' }).TRUST_PROXY).toBe(true);
+    expect(() => loadConfig({ ...env0, TRUST_PROXY: 'maybe' })).toThrow();
+  });
+});
+
+describe('inbox ingest', () => {
+  it('refuses a file over the size limit before reading it', async () => {
+    const path = join(env.inboxDir, 'huge.mp4');
+    const fd = openSync(path, 'w');
+    ftruncateSync(fd, 601 * 1024 * 1024); // sparse: no disk or memory is used
+    closeSync(fd);
+    await expect(env.services.media.ingestFromInbox('/host/inbox/huge.mp4')).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/MiB/),
+    });
+  });
+
+  it('leaves no file behind when the probe of a new upload fails', async () => {
+    // An MP4 header followed by zeros: recognised as video, rejected by the probe.
+    const buf = Buffer.concat([
+      Buffer.from([0, 0, 0, 0x18]),
+      Buffer.from('ftypisom'),
+      Buffer.alloc(4096),
+    ]);
+    writeFileSync(join(env.inboxDir, 'broken.mp4'), buf);
+    await expect(
+      env.services.media.ingestFromInbox('/host/inbox/broken.mp4'),
+    ).rejects.toMatchObject({ code: 'MEDIA_UNSUPPORTED' });
+    const sha = (await import('node:crypto')).createHash('sha256').update(buf).digest('hex');
+    expect(existsSync(join(env.services.config.mediaDir, sha))).toBe(false);
   });
 });

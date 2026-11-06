@@ -74,6 +74,13 @@ export class AuthService {
   }
 
   totpSetup(): { secret: string; otpauthUrl: string } {
+    // Enrolling replaces the second factor, so it needs the same proof as removing it. While a
+    // factor is active the only way out is totpDisable, which requires a current code.
+    if (this.totpEnabled())
+      throw new PosterError(
+        'STATE_INVALID',
+        'TOTP is already enabled. Disable it with a current code before enrolling a new authenticator.',
+      );
     const secret = new OTPAuth.Secret({ size: 20 });
     const totp = new OTPAuth.TOTP({
       issuer: 'Social Poster',
@@ -88,6 +95,7 @@ export class AuthService {
   }
 
   totpEnable(code: string): void {
+    if (this.totpEnabled()) throw new PosterError('STATE_INVALID', 'TOTP is already enabled.');
     const pending = this.settings.getSecret('ui.totpPending');
     if (!pending) throw new PosterError('STATE_INVALID', 'Run TOTP setup first.');
     if (!verifyTotp(pending, code)) throw new PosterError('UNAUTHORIZED', 'Wrong TOTP code.');
@@ -101,6 +109,8 @@ export class AuthService {
     if (!secret) return;
     if (!verifyTotp(secret, code)) throw new PosterError('UNAUTHORIZED', 'Wrong TOTP code.');
     this.settings.setSecret('ui.totpSecret', null);
+    // A pending secret left over from an earlier setup must not be promotable later.
+    this.settings.setSecret('ui.totpPending', null);
     this.audit.record('ui', 'auth.totp_disabled');
   }
 

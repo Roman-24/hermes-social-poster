@@ -35,8 +35,17 @@ const EnvSchema = z.object({
   LOG_PRETTY: z.string().optional(),
   /** Scheduler poll interval (ms). */
   SCHEDULER_INTERVAL_MS: z.coerce.number().int().default(5000),
-  /** Trust X-Forwarded-* from tailscale serve (loopback only). */
-  TRUST_PROXY: z.string().optional(),
+  /**
+   * Trust X-Forwarded-* from a proxy on loopback (tailscale serve). Parsed as a real boolean: the
+   * strings "false" and "0" used to count as set, which silently turned trust ON.
+   */
+  TRUST_PROXY: z.preprocess((v) => {
+    if (v === undefined) return undefined;
+    const s = String(v).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(s)) return true;
+    if (['', '0', 'false', 'no', 'off'].includes(s)) return false;
+    return v; // anything else fails validation instead of guessing
+  }, z.boolean().optional()),
   NODE_ENV: z.string().optional(),
 });
 

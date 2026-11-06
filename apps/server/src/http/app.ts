@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { PosterError } from '@poster/core';
 import type { Services } from '../bootstrap.js';
 import { mcpRoutes } from '../mcp/index.js';
+import { MAX_MEDIA_BYTES } from '../services/media.js';
 import { hostAllowed, makeAuthHooks } from './auth-hooks.js';
 import { errorHandler, sendProblem } from './problem.js';
 import { accountRoutes } from './routes/accounts.js';
@@ -24,7 +25,7 @@ export async function buildApp(services: Services): Promise<FastifyInstance> {
   const { config, logger, vault } = services;
   const app = Fastify({
     loggerInstance: logger.child({ component: 'http' }),
-    trustProxy: config.TRUST_PROXY ? '127.0.0.1' : false,
+    trustProxy: config.TRUST_PROXY === true ? '127.0.0.1' : false,
     bodyLimit: 2 * 1024 * 1024,
     forceCloseConnections: config.isTest ? true : 'idle',
   }) as unknown as FastifyInstance;
@@ -34,7 +35,7 @@ export async function buildApp(services: Services): Promise<FastifyInstance> {
 
   await app.register(cookie, { secret: vault.hmac('cookie', 'signing-key') });
   await app.register(rateLimit, { global: false });
-  await app.register(multipart, { limits: { fileSize: 600 * 1024 * 1024, files: 1, fields: 5 } });
+  await app.register(multipart, { limits: { fileSize: MAX_MEDIA_BYTES, files: 1, fields: 5 } });
   await app.register(websocket, { options: { maxPayload: 1024 * 1024 } });
 
   // Host check (DNS rebinding) for everything but /health.

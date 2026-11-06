@@ -5,6 +5,18 @@ import type { Services } from '../../bootstrap.js';
 import type { BrowserClientMessage } from '../../services/browser-sessions.js';
 import type { AuthHooks } from '../auth-hooks.js';
 
+/** How often an open socket re-checks that its session still exists. */
+const SESSION_RECHECK_MS = 5_000;
+
+function originMatchesHost(origin: string, host: string | undefined): boolean {
+  if (!host) return false;
+  try {
+    return new URL(origin).host.toLowerCase() === host.toLowerCase();
+  } catch {
+    return false; // "null" and other opaque origins
+  }
+}
+
 const ClientMessage = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('mouse'),
@@ -37,16 +49,65 @@ export async function wsRoutes(
   services: Services,
   hooks: AuthHooks,
 ): Promise<void> {
-  const { events, browserSessions, logger } = services;
+  const { events, browserSessions, logger, auth } = services;
 
-  // Cookie auth for both sockets (no CSRF: WebSocket upgrades are GETs and SameSite=Strict applies).
+  /**
+   * Cookie auth for both sockets. A WebSocket upgrade is a GET, so the CSRF token that protects
+   * the REST mutations does not apply, and SameSite=Strict only separates sites, not origins on
+   * the same site. A browser always sends Origin on an upgrade, so require it to be this host;
+   * clients that are not browsers send none and are authenticated by the cookie alone.
+   */
   const requireUiSocket = async (request: Parameters<typeof hooks.uiSession>[0]) => {
     if (!hooks.uiSession(request)) throw new PosterError('UNAUTHORIZED', 'Login required.');
+    const origin = request.headers.origin;
+    if (origin !== undefined && !originMatchesHost(origin, request.headers.host)) {
+      throw new PosterError('FORBIDDEN', 'Cross-origin WebSocket connections are not allowed.');
+    }
   };
 
-  app.get('/ws/events', { websocket: true, preValidation: requireUiSocket }, (socket) => {
+  /**
+   * The cookie is checked once, at the upgrade, so tie the socket to that session and look again:
+   * on a timer and before each client message. Logout, a password change, the CLI's set-password
+   * (another process) and the 12 h expiry all delete the session row; none of them can reach a
+   * socket, so the socket has to notice. Returns a function that is true while the session lives.
+   */
+  const bindToSession = (
+    socket: {
+      close(code?: number, reason?: string): void;
+      on(ev: 'close' | 'error', cb: () => void): unknown;
+    },
+    request: Parameters<typeof hooks.uiSession>[0],
+    onEnd: () => void,
+  ): (() => boolean) => {
+    const session = hooks.uiSession(request);
+    let ended = false;
+    const end = () => {
+      if (ended) return;
+      ended = true;
+      clearInterval(guard);
+      onEnd();
+      socket.close(4401, 'session ended');
+    };
+    const alive = (): boolean => {
+      if (ended) return false;
+      if (session && auth.validateSession(session.id)) return true;
+      end();
+      return false;
+    };
+    const guard = setInterval(alive, SESSION_RECHECK_MS);
+    guard.unref();
+    socket.on('close', () => clearInterval(guard));
+    socket.on('error', () => clearInterval(guard));
+    return alive;
+  };
+
+  app.get('/ws/events', { websocket: true, preValidation: requireUiSocket }, (socket, request) => {
+    const alive = bindToSession(socket, request, () => {
+      off();
+      clearInterval(ping);
+    });
     const send = (msg: unknown) => {
-      if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(msg));
+      if (socket.readyState === socket.OPEN && alive()) socket.send(JSON.stringify(msg));
     };
     const off = events.on((ev) => send(ev));
     const ping = setInterval(() => send({ type: 'ping' }), 25_000);
@@ -65,10 +126,11 @@ export async function wsRoutes(
     { websocket: true, preValidation: requireUiSocket },
     (socket, request) => {
       const id = request.params.id;
-      const send = (msg: unknown) => {
-        if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(msg));
-      };
       let off: (() => void) | null = null;
+      const alive = bindToSession(socket, request, () => off?.());
+      const send = (msg: unknown) => {
+        if (socket.readyState === socket.OPEN && alive()) socket.send(JSON.stringify(msg));
+      };
       try {
         off = browserSessions.subscribe(id, send);
       } catch (err) {
@@ -81,6 +143,7 @@ export async function wsRoutes(
         return;
       }
       socket.on('message', (raw) => {
+        if (!alive()) return; // revoked or expired: the socket is closed and the message dropped
         let msg: BrowserClientMessage;
         try {
           msg = ClientMessage.parse(JSON.parse(raw.toString())) as BrowserClientMessage;

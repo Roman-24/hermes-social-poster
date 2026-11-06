@@ -51,6 +51,9 @@ interface Probe {
  * Media pipeline: ingest once (from the inbox or a multipart upload), store under
  * /data/media/<sha256>/, probe, and derive per-network variants lazily at render time.
  */
+/** Largest file accepted by any ingest path (matches the multipart upload limit). */
+export const MAX_MEDIA_BYTES = 600 * 1024 * 1024;
+
 export class MediaService {
   constructor(
     private readonly db: Db,
@@ -106,6 +109,15 @@ export class MediaService {
 
   async ingestFromInbox(hostPath: string, altText?: string): Promise<MediaUploadResult> {
     const real = this.resolveInboxPath(hostPath);
+    // Check the size before reading: the whole file goes into one buffer, and a path from the
+    // inbox is not covered by the multipart limit.
+    const size = statSync(real).size;
+    if (size > MAX_MEDIA_BYTES) {
+      throw new PosterError(
+        'VALIDATION',
+        `File is ${Math.round(size / 1024 / 1024)} MiB, over the ${MAX_MEDIA_BYTES / 1024 / 1024} MiB limit.`,
+      );
+    }
     const buf = await readFile(real);
     return this.ingestBuffer(buf, { sourcePath: hostPath, altText, originalName: basename(real) });
   }
@@ -125,12 +137,20 @@ export class MediaService {
     }
     const sha256 = createHash('sha256').update(buf).digest('hex');
     const dir = join(this.config.mediaDir, sha256);
-    mkdirSync(dir, { recursive: true });
     const originalPath = join(dir, `original.${EXT_FOR_MIME[mime] ?? 'bin'}`);
-    if (!existsSync(originalPath)) await writeFile(originalPath, buf);
+    const created = !existsSync(originalPath);
+    mkdirSync(dir, { recursive: true });
+    if (created) await writeFile(originalPath, buf);
 
-    const probe =
-      kind === 'image' ? await this.probeImage(buf) : await this.probeVideo(originalPath);
+    let probe: Probe;
+    try {
+      probe = kind === 'image' ? await this.probeImage(buf) : await this.probeVideo(originalPath);
+    } catch (err) {
+      // No row will point at a file this call just wrote, and the retention job only looks at
+      // rows, so remove it now instead of leaving it on disk forever.
+      if (created) rmSync(dir, { recursive: true, force: true });
+      throw err;
+    }
     const id = newId();
     const now = Date.now();
     this.db
