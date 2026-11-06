@@ -2,13 +2,15 @@ import argon2 from 'argon2';
 import { and, eq, isNull } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
-import type { DraftPreview } from '@poster/core';
+import { newId, type DraftPreview } from '@poster/core';
 import {
   draftCodes,
   notifications as notificationsTable,
   posts,
   postTargets,
 } from './db/schema.js';
+import { nullLogger } from './logger.js';
+import { Notifier } from './services/notifier.js';
 import { createTestEnv, HOST, type TestEnv } from './test-helpers.js';
 
 /**
@@ -454,5 +456,166 @@ describe('without a direct route the code stays out of the agent unless soft mod
     const d = await env.services.posts.createDraft({ text: 'soft', networks: ['x'] }, 'mcp');
     expect(d.codeDelivery).toBe('returned');
     expect(d.code).toMatch(/^[A-Z2-9]{6}$/);
+  });
+});
+
+describe('thread resume sends each part exactly once', () => {
+  const thread = (n: number) =>
+    Array.from({ length: n }, (_, i) => `part number ${i + 1}`).join('\n---\n');
+  const targetOf = (id: string) => env.services.posts.get(id).targets[0]!;
+
+  it('continues from the first unpublished part after a transient failure', async () => {
+    env.fakes.x.options.failAtPart = 1;
+    env.fakes.x.options.failTimes = 1;
+    const d = await env.services.posts.createDraft({ text: thread(3), networks: ['x'] }, 'ui');
+    await env.services.posts.confirm(d.draftId, { trusted: true, actor: 'ui' });
+    await env.services.scheduler.tick();
+    await vi.waitFor(() => expect(targetOf(d.draftId).status).toBe('retrying'));
+    expect(targetOf(d.draftId).remoteIds).toHaveLength(1);
+
+    await env.services.scheduler.tick(Date.now() + 2 * 60_000);
+    await vi.waitFor(() => expect(targetOf(d.draftId).status).toBe('published'));
+    expect(env.fakes.x.sentParts).toEqual([
+      'part number 1 (1/3)',
+      'part number 2 (2/3)',
+      'part number 3 (3/3)',
+    ]);
+    const ids = targetOf(d.draftId).remoteIds;
+    expect(ids).toHaveLength(3);
+    expect(new Set(ids).size).toBe(3);
+  });
+
+  it('keeps the part count honest across two partial failures', async () => {
+    env.fakes.x.options.failAtPart = 1;
+    const d = await env.services.posts.createDraft({ text: thread(4), networks: ['x'] }, 'ui');
+    await env.services.posts.confirm(d.draftId, { trusted: true, actor: 'ui' });
+    await env.services.scheduler.tick();
+    await vi.waitFor(() => expect(targetOf(d.draftId).status).toBe('retrying'));
+
+    env.fakes.x.options.failAtPart = 3;
+    await env.services.scheduler.tick(Date.now() + 2 * 60_000);
+    await vi.waitFor(() => expect(targetOf(d.draftId).remoteIds).toHaveLength(3));
+    expect(new Set(targetOf(d.draftId).remoteIds).size).toBe(3);
+    expect(targetOf(d.draftId).lastErrorMessage).toMatch(/parts 1-3 are published/);
+
+    env.fakes.x.options.failAtPart = undefined;
+    await env.services.scheduler.tick(Date.now() + 30 * 60_000);
+    await vi.waitFor(() => expect(targetOf(d.draftId).status).toBe('published'));
+    expect(env.fakes.x.sentParts).toHaveLength(4);
+    expect(new Set(targetOf(d.draftId).remoteIds).size).toBe(4);
+  });
+});
+
+describe('publishing targets orphaned by a restart are surfaced', () => {
+  async function leasedTarget() {
+    const d = await env.services.posts.createDraft(
+      { text: 'mid-publish', networks: ['nostr'] },
+      'ui',
+    );
+    await env.services.posts.confirm(d.draftId, { trusted: true, actor: 'ui' });
+    // Model a process that died after leasing: status publishing, lease 15 minutes ahead.
+    env.services.db
+      .update(postTargets)
+      .set({ status: 'publishing', leaseUntil: Date.now() + 15 * 60_000 })
+      .where(eq(postTargets.postId, d.draftId))
+      .run();
+    return d.draftId;
+  }
+
+  it('recovers an unexpired lease at startup, because no runner can own it yet', async () => {
+    const id = await leasedTarget();
+    env.services.scheduler.recoverStaleLeases(true);
+    const t = env.services.posts.get(id).targets[0]!;
+    expect(t.status).toBe('failed');
+    expect(t.lastErrorCode).toBe('UNKNOWN_OUTCOME');
+    expect(env.fakes.nostr.published).toHaveLength(0);
+  });
+
+  it('leaves a live lease alone at runtime but recovers it once it has expired', async () => {
+    const id = await leasedTarget();
+    env.services.scheduler.recoverStaleLeases(false, Date.now() + 5 * 60_000);
+    expect(env.services.posts.get(id).targets[0]!.status).toBe('publishing');
+    env.services.scheduler.recoverStaleLeases(false, Date.now() + 16 * 60_000);
+    expect(env.services.posts.get(id).targets[0]!.lastErrorCode).toBe('UNKNOWN_OUTCOME');
+  });
+
+  it('does not touch a publish that is genuinely running in this process', async () => {
+    env.fakes.nostr.options.delayMs = 300;
+    const d = await env.services.posts.createDraft(
+      { text: 'slow publish', networks: ['nostr'] },
+      'ui',
+    );
+    await env.services.posts.confirm(d.draftId, { trusted: true, actor: 'ui' });
+    await env.services.scheduler.tick();
+    await vi.waitFor(() =>
+      expect(env.services.posts.get(d.draftId).targets[0]!.status).toBe('publishing'),
+    );
+    // A later tick, far past the lease, must not declare the live run orphaned.
+    await env.services.scheduler.tick(Date.now() + 60 * 60_000);
+    await vi.waitFor(() =>
+      expect(env.services.posts.get(d.draftId).targets[0]!.status).toBe('published'),
+    );
+  });
+});
+
+describe('the webhook outbox parks rows that gave up', () => {
+  it('does not re-send parked rows on every tick and still delivers newer events', async () => {
+    env.services.settings.update({ hermes: { webhookBaseUrl: 'http://hermes.test:8644' } });
+    const calls: string[] = [];
+    const notifier = new Notifier(
+      env.services.db,
+      env.services.settings,
+      env.services.events,
+      nullLogger(),
+      async (url) => {
+        calls.push(url);
+        return new Response('no', { status: url.endsWith('/old-route') ? 404 : 200 });
+      },
+    );
+    const now = Date.now();
+    const oldIds: string[] = [];
+    for (let i = 0; i < 22; i++) {
+      const id = newId();
+      oldIds.push(id);
+      env.services.db
+        .insert(notificationsTable)
+        .values({
+          id,
+          event: 'failed',
+          route: 'old-route',
+          payload: { message: 'old' },
+          attempts: 3,
+          nextAttemptAt: now - 1000,
+          createdAt: now - 25 * 3600_000,
+        })
+        .run();
+    }
+    const fresh = newId();
+    env.services.db
+      .insert(notificationsTable)
+      .values({
+        id: fresh,
+        event: 'confirmation_code',
+        route: 'poster-direct',
+        payload: { message: 'code' },
+        attempts: 0,
+        nextAttemptAt: now,
+        createdAt: now,
+      })
+      .run();
+    await notifier.tick();
+    await notifier.tick();
+    await notifier.tick();
+    await notifier.tick();
+    const row = (id: string) =>
+      env.services.db.select().from(notificationsTable).where(eq(notificationsTable.id, id)).get()!;
+    expect(row(fresh).deliveredAt).not.toBeNull();
+    expect(calls.filter((u) => u.endsWith('/old-route'))).toHaveLength(22);
+    expect(calls.filter((u) => u.endsWith('/poster-direct'))).toHaveLength(1);
+    expect(row(oldIds[0]!).nextAttemptAt).toBeNull();
+    // The operator can still revive a parked row by hand.
+    await notifier.retry(oldIds[0]!);
+    expect(calls.filter((u) => u.endsWith('/old-route'))).toHaveLength(23);
+    expect(row(oldIds[0]!).nextAttemptAt).toBeNull();
   });
 });

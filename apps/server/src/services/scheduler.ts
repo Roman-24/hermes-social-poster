@@ -37,6 +37,8 @@ export class Scheduler {
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
   private readonly inFlight = new Map<Network, Promise<void>>();
+  /** Target ids owned by a runner in THIS process; anything else in `publishing` is an orphan. */
+  private readonly activeTargets = new Set<string>();
   lastTickAt = 0;
   lagMs = 0;
 
@@ -56,7 +58,9 @@ export class Scheduler {
 
   start(intervalMs = 5000): void {
     if (this.timer) return;
-    this.recoverStaleLeases();
+    // Nothing can be running yet, so every row still in `publishing` belongs to a dead process,
+    // whatever its lease says: the restart is usually seconds after the crash, well inside the lease.
+    this.recoverStaleLeases(true);
     this.timer = setInterval(() => void this.tick(), intervalMs);
     this.timer.unref();
     void this.tick();
@@ -73,35 +77,43 @@ export class Scheduler {
   }
 
   /**
-   * Targets left in `publishing` with an expired lease belong to a crashed run. Whether the
-   * network accepted the post is unknown, so we never retry automatically.
+   * Targets left in `publishing` by a run that no longer exists. Whether the network accepted the
+   * post is unknown, so we never retry automatically: the target fails with UNKNOWN_OUTCOME and
+   * the operator decides.
+   *
+   * At startup every `publishing` row is an orphan. While running, a row is an orphan when its
+   * lease has expired and no runner in this process owns it.
    */
-  recoverStaleLeases(): void {
-    const now = Date.now();
+  recoverStaleLeases(atStartup = false, now = Date.now()): void {
     const stale = this.db
       .select()
       .from(postTargets)
       .where(
-        and(
-          eq(postTargets.status, 'publishing'),
-          or(isNull(postTargets.leaseUntil), lt(postTargets.leaseUntil, now)),
-        ),
+        atStartup
+          ? eq(postTargets.status, 'publishing')
+          : and(
+              eq(postTargets.status, 'publishing'),
+              or(isNull(postTargets.leaseUntil), lt(postTargets.leaseUntil, now)),
+            ),
       )
-      .all();
+      .all()
+      .filter((t) => !this.activeTargets.has(t.id));
     for (const t of stale) {
       this.failTarget(
         t.id,
         t.postId,
         t.network as Network,
         'UNKNOWN_OUTCOME',
-        'The app restarted while this target was publishing; check the network manually before retrying.',
+        atStartup
+          ? 'The app restarted while this target was publishing; check the network manually before retrying.'
+          : 'This target stayed in publishing past its lease without finishing; check the network manually before retrying.',
         { needsDecision: true },
       );
     }
     if (stale.length)
       this.logger.warn(
         { count: stale.length },
-        'recovered stale publishing leases as UNKNOWN_OUTCOME',
+        'recovered orphaned publishing targets as UNKNOWN_OUTCOME',
       );
   }
 
@@ -111,6 +123,7 @@ export class Scheduler {
     this.lastTickAt = now;
     try {
       this.postsSvc.expireDrafts(now);
+      this.recoverStaleLeases(false, now);
       this.failMissedWindows(now);
       const due = this.dueTargets(now);
       if (due.length) this.lagMs = Math.max(0, now - Math.min(...due.map((t) => t.scheduledAtUtc)));
@@ -120,9 +133,13 @@ export class Scheduler {
         const network = t.network as Network;
         if (this.inFlight.has(network)) continue; // one at a time per network
         if (!this.lease(t.id, now)) continue;
+        this.activeTargets.add(t.id);
         const p = this.runTarget(t.id)
           .catch((err) => this.logger.error({ err, targetId: t.id }, 'runTarget crashed'))
-          .finally(() => this.inFlight.delete(network));
+          .finally(() => {
+            this.inFlight.delete(network);
+            this.activeTargets.delete(t.id);
+          });
         this.inFlight.set(network, p);
       }
     } catch (err) {
@@ -298,18 +315,15 @@ export class Scheduler {
 
     const started = Date.now();
     try {
-      // Skip parts already published in an earlier attempt (thread resume).
-      const toPublish: RenderedPost = rendered.publishedRemoteIds?.length
-        ? { ...rendered, parts: rendered.parts.slice(rendered.publishedRemoteIds.length) }
-        : rendered;
-      if (toPublish.parts.length === 0) {
+      // Thread resume: adapters take the FULL part list plus `publishedRemoteIds`, continue from
+      // the first unpublished part, and return the cumulative ids. Do not slice or merge here.
+      if ((rendered.publishedRemoteIds?.length ?? 0) >= rendered.parts.length) {
         throw new PosterError('STATE_INVALID', 'All parts are already published.', {
           retryable: false,
         });
       }
-      const result = await adapter.publish(toPublish, ctx);
-      const remoteIds = [...(rendered.publishedRemoteIds ?? []), ...result.remoteIds];
-      this.succeed(targetId, post, network, { ...result, remoteIds }, attemptId, started);
+      const result = await adapter.publish(rendered, ctx);
+      this.succeed(targetId, post, network, result, attemptId, started);
     } catch (err) {
       await this.handleFailure(err, {
         targetId,
@@ -401,7 +415,8 @@ export class Scheduler {
     let cause = err;
     let publishedSoFar: string[] | null = null;
     if (err instanceof PartialPublishError) {
-      publishedSoFar = [...(c.rendered.publishedRemoteIds ?? []), ...err.publishedRemoteIds];
+      // Adapters report the cumulative ids, earlier parts included.
+      publishedSoFar = [...err.publishedRemoteIds];
       cause = err.cause;
       this.db
         .update(postTargets)

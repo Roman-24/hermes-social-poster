@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import { and, desc, eq, isNull, lte, or } from 'drizzle-orm';
+import { and, desc, eq, isNotNull, isNull, lte } from 'drizzle-orm';
 import { newId, type NotificationView, type WebhookEvent } from '@poster/core';
 import type { Db } from '../db/index.js';
 import { notifications } from '../db/schema.js';
@@ -92,7 +92,11 @@ export class Notifier {
         .where(
           and(
             isNull(notifications.deliveredAt),
-            or(isNull(notifications.nextAttemptAt), lte(notifications.nextAttemptAt, now)),
+            // A NULL nextAttemptAt means "parked": it gave up after 24 h and only the UI's manual
+            // retry revives it. Selecting it here would re-send it on every tick and, with the
+            // fixed batch size, let enough of them hide every newer event.
+            isNotNull(notifications.nextAttemptAt),
+            lte(notifications.nextAttemptAt, now),
           ),
         )
         .orderBy(notifications.createdAt)

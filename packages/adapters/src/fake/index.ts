@@ -34,16 +34,21 @@ export function createFakeAdapter(
   opts: FakeAdapterOptions = {},
 ): NetworkAdapter & {
   published: { post: RenderedPost; attemptKey: string }[];
+  /** Text of every part actually sent, in order (parts skipped on a resume are not repeated). */
+  sentParts: string[];
   options: FakeAdapterOptions;
 } {
   const published: { post: RenderedPost; attemptKey: string }[] = [];
+  const sentParts: string[] = [];
   let failures = 0;
+  let partFailures = 0;
   const options: FakeAdapterOptions = { connected: true, handle: `fake_${id}`, ...opts };
 
   return {
     id,
     capabilities: DEFAULT_LIMITS[id],
     published,
+    sentParts,
     options,
     connect: {
       kind: 'credentials',
@@ -83,11 +88,21 @@ export function createFakeAdapter(
         if (options.failWith === 'throw') throw new Error('fake adapter exploded');
         throw new PosterError(options.failWith as never, `fake failure ${options.failWith}`);
       }
-      if (options.failAtPart !== undefined && post.parts.length > options.failAtPart) {
+      // Like the real adapters: `publishedRemoteIds` are the parts already out, the part list is
+      // the full one, and the result carries the cumulative ids.
+      const prior = post.publishedRemoteIds ?? [];
+      const start = prior.length;
+      if (
+        options.failAtPart !== undefined &&
+        post.parts.length > options.failAtPart &&
+        start <= options.failAtPart &&
+        (options.failTimes === undefined || partFailures < options.failTimes)
+      ) {
+        partFailures++;
         const { PartialPublishError } = await import('@poster/core');
-        const ok = post.parts
-          .slice(0, options.failAtPart)
-          .map((_, i) => `fake-${post.targetId}-${i}`);
+        const sent = post.parts.slice(start, options.failAtPart);
+        sentParts.push(...sent.map((p) => p.text));
+        const ok = [...prior, ...sent.map((_, i) => `fake-${post.targetId}-${start + i}`)];
         throw new PartialPublishError(
           ok,
           options.failAtPart,
@@ -95,7 +110,9 @@ export function createFakeAdapter(
         );
       }
       published.push({ post, attemptKey: ctx.attemptKey });
-      const remoteIds = post.parts.map((_, i) => `fake-${post.targetId}-${i}`);
+      const sent = post.parts.slice(start);
+      sentParts.push(...sent.map((p) => p.text));
+      const remoteIds = [...prior, ...sent.map((_, i) => `fake-${post.targetId}-${start + i}`)];
       return { url: `https://fake.${id}.example/${post.targetId}`, remoteIds };
     },
     async selfTest() {
