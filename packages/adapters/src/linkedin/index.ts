@@ -33,7 +33,7 @@ import {
   type RenderedPost,
   type SelfTestResult,
 } from '@poster/core';
-import { expectOk, fetchWithTimeout, readJson, sleep } from '../http.js';
+import { expectOk, fetchWithTimeout, readJson, safeText, sleep } from '../http.js';
 
 const NETWORK = 'linkedin' as const;
 
@@ -297,7 +297,7 @@ async function createPost(
   });
   await expectOk(res, { service: 'LinkedIn posts.create' });
   const urn = res.headers.get('x-restli-id') ?? res.headers.get('x-linkedin-id');
-  await res.text().catch(() => '');
+  await safeText(res);
   if (!urn)
     throw new PosterError(
       'UNKNOWN_OUTCOME',

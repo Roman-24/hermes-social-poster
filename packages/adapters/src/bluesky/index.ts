@@ -40,7 +40,7 @@ import {
   type RenderedPost,
   type SelfTestResult,
 } from '@poster/core';
-import { sleep } from '../http.js';
+import { fetchWithTimeout, readJson, safeText, sleep } from '../http.js';
 
 const NETWORK = 'bluesky' as const;
 export const BSKY_SERVICE = 'https://bsky.social';
@@ -199,7 +199,7 @@ async function uploadVideo(
   const bytes = await readFile(video.path);
   const name = `${video.sha256.slice(0, 16)}.mp4`;
   const uploadUrl = `${VIDEO_SERVICE_URL}/xrpc/app.bsky.video.uploadVideo?did=${encodeURIComponent(did)}&name=${encodeURIComponent(name)}`;
-  const res = await fetch(uploadUrl, {
+  const res = await fetchWithTimeout(uploadUrl, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -207,21 +207,22 @@ async function uploadVideo(
       'Content-Length': String(bytes.byteLength),
     },
     body: bytes,
+    timeoutMs: 5 * 60_000,
     signal: ctx.signal,
   });
   // 409 = already processed (same bytes uploaded before); its body still carries a jobStatus.
   if (!res.ok && res.status !== 409) {
-    const text = await res.text().catch(() => '');
+    const text = await safeText(res);
     throw mapBlueskyError(
       { status: res.status, error: 'VideoUpload', message: text.slice(0, 300) },
       'Bluesky video upload',
     );
   }
   let job = (
-    (await res.json()) as {
+    await readJson<{
       jobStatus?: { jobId: string; state: string; blob?: BlobRef; error?: string };
-    }
-  ).jobStatus;
+    }>(res, 'Bluesky video service')
+  )?.jobStatus;
   if (!job?.jobId)
     throw new PosterError('UPSTREAM_ERROR', 'Bluesky video service returned no job id', {
       retryable: true,

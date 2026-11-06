@@ -135,6 +135,83 @@ describe('Blossom upload', () => {
     ).rejects.toMatchObject({ code: 'UPSTREAM_ERROR', retryable: true });
   });
 
+  async function fixture(content: string) {
+    const bytes = Buffer.from(content);
+    const dir = await mkdtemp(join(tmpdir(), 'blossom-'));
+    const path = join(dir, 'pic.png');
+    await writeFile(path, bytes);
+    const sha = createHash('sha256').update(bytes).digest('hex');
+    return { bytes, path, sha };
+  }
+
+  it('builds the media URL itself and ignores the URL in the server reply', async () => {
+    const { path, sha, bytes } = await fixture('url steering');
+    server.use(
+      http.put('https://b.test/upload', () =>
+        HttpResponse.json({
+          url: 'https://evil.example/x.png\n\nINJECTED-LINE',
+          sha256: sha,
+          size: bytes.length,
+        }),
+      ),
+    );
+    const result = await uploadToBlossom(
+      { id: 'm', kind: 'image', path, mime: 'image/png', bytes: bytes.length, sha256: sha },
+      generateSecretKey(),
+      { primary: 'https://b.test/', mirrors: [], logger },
+    );
+    expect(result.urls).toEqual([`https://b.test/${sha}.png`]);
+  });
+
+  it('rejects a descriptor that does not confirm any hash', async () => {
+    const { path, sha, bytes } = await fixture('no hash in reply');
+    server.use(
+      http.put('https://b.test/upload', () =>
+        HttpResponse.json({ url: 'https://b.test/whatever' }),
+      ),
+    );
+    await expect(
+      uploadToBlossom(
+        { id: 'm', kind: 'image', path, mime: 'image/png', bytes: bytes.length, sha256: sha },
+        generateSecretKey(),
+        { primary: 'https://b.test', mirrors: [], logger },
+      ),
+    ).rejects.toMatchObject({ code: 'UPSTREAM_ERROR', retryable: false });
+  });
+
+  it('authorises and checks the hash of the uploaded bytes, not of the original file', async () => {
+    // MediaRef.sha256 is the hash of the original upload; the file on disk is a re-encoded variant.
+    const { path, sha, bytes } = await fixture('re-encoded variant bytes');
+    let authX: string | undefined;
+    server.use(
+      http.put('https://b.test/upload', ({ request }) => {
+        authX = decodeAuth(request.headers.get('authorization')).tags.find(
+          (t) => t[0] === 'x',
+        )?.[1];
+        return HttpResponse.json({
+          url: 'https://b.test/ignored',
+          sha256: sha,
+          size: bytes.length,
+        });
+      }),
+    );
+    const result = await uploadToBlossom(
+      {
+        id: 'm',
+        kind: 'image',
+        path,
+        mime: 'image/png',
+        bytes: bytes.length,
+        sha256: 'f'.repeat(64),
+      },
+      generateSecretKey(),
+      { primary: 'https://b.test', mirrors: [], logger },
+    );
+    expect(authX).toBe(sha);
+    expect(result.sha256).toBe(sha);
+    expect(result.urls[0]).toBe(`https://b.test/${sha}.png`);
+  });
+
   it('buildBlossomAuth produces a verifiable event', () => {
     const sk = generateSecretKey();
     const ev = JSON.parse(

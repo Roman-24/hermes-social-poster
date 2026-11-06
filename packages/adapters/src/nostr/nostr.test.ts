@@ -20,6 +20,7 @@ import {
   imetaTag,
   parseSecretKey,
 } from './index.js';
+import { PosterError } from '@poster/core';
 
 const logger = {
   debug() {},
@@ -261,5 +262,127 @@ describe('Nostr adapter', () => {
     const res = await adapter.selfTest?.(account, ctx([good1.url(), good2.url()], 2));
     expect(res?.ok).toBe(true);
     expect(res?.message).toMatch(/2\/2 relays reachable/);
+  });
+});
+
+/** A relay whose answer can change between attempts. */
+async function startSwitchRelay(initial: 'ok' | 'refuse' | 'duplicate') {
+  const wss = new WebSocketServer({ port: 0 });
+  await once(wss, 'listening');
+  const events: Event[] = [];
+  const state = { mode: initial };
+  wss.on('connection', (socket: WebSocket) => {
+    socket.on('message', (raw) => {
+      const msg = JSON.parse(raw.toString()) as unknown[];
+      if (msg[0] === 'EVENT') {
+        const ev = msg[1] as Event;
+        if (state.mode === 'ok') events.push(ev);
+        socket.send(
+          JSON.stringify([
+            'OK',
+            ev.id,
+            state.mode === 'ok',
+            state.mode === 'refuse'
+              ? 'rate-limited: slow down'
+              : state.mode === 'duplicate'
+                ? 'duplicate: have this event'
+                : '',
+          ]),
+        );
+      } else if (msg[0] === 'REQ') socket.send(JSON.stringify(['EOSE', msg[1]]));
+    });
+  });
+  return {
+    wss,
+    events,
+    state,
+    url: () => `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`,
+    close: () => new Promise<void>((r) => wss.close(() => r())),
+  };
+}
+
+describe('Nostr retry safety', () => {
+  it('re-sends the same signed event after a partial acknowledgement, so no second note appears', async () => {
+    const a = await startSwitchRelay('ok');
+    const b = await startSwitchRelay('refuse');
+    const adapter = createNostrAdapter();
+    const scheduledAtUtc = Date.parse('2026-05-01T10:00:00Z');
+    const p: RenderedPost = { ...post(['one note']), scheduledAtUtc };
+    try {
+      // minRelays 2: only relay A answers OK, so the first attempt fails but A already holds the note.
+      await expect(adapter.publish(p, ctx([a.url(), b.url()], 2))).rejects.toMatchObject({
+        code: 'UPSTREAM_ERROR',
+        retryable: true,
+      });
+      expect(a.events).toHaveLength(1);
+
+      // A later attempt, a different wall-clock second, with relay B now accepting.
+      await new Promise((r) => setTimeout(r, 1_100));
+      b.state.mode = 'ok';
+      a.state.mode = 'duplicate';
+      const result = await adapter.publish(p, ctx([a.url(), b.url()], 2));
+      expect(result.remoteIds).toHaveLength(1);
+      expect(b.events).toHaveLength(1);
+      // Same event on both relays: same id, same created_at taken from the scheduled time.
+      expect(b.events[0]?.id).toBe(a.events[0]?.id);
+      expect(a.events[0]?.created_at).toBe(Math.floor(scheduledAtUtc / 1000));
+      expect(verifyEvent(b.events[0] as Event)).toBe(true);
+    } finally {
+      await a.close();
+      await b.close();
+    }
+  });
+
+  it('counts a "duplicate:" answer as an acknowledgement', async () => {
+    const a = await startSwitchRelay('duplicate');
+    const b = await startSwitchRelay('duplicate');
+    try {
+      const r = await createNostrAdapter().publish(
+        post(['already there']),
+        ctx([a.url(), b.url()], 2),
+      );
+      expect(r.relaysOk).toBe(2);
+    } finally {
+      await a.close();
+      await b.close();
+    }
+  });
+
+  it('gives thread parts distinct, ordered timestamps derived from the schedule', async () => {
+    const a = await startSwitchRelay('ok');
+    const scheduledAtUtc = Date.parse('2026-05-01T10:00:00Z');
+    try {
+      await createNostrAdapter().publish(
+        { ...post(['first', 'second', 'third']), scheduledAtUtc },
+        ctx([a.url()], 1),
+      );
+      expect(a.events.map((e) => e.created_at)).toEqual(
+        [0, 1, 2].map((i) => scheduledAtUtc / 1000 + i),
+      );
+    } finally {
+      await a.close();
+    }
+  });
+});
+
+describe('parseSecretKey errors', () => {
+  it('does not echo a mistyped nsec, its checksum or the library error', () => {
+    const good = nip19.nsecEncode(sk);
+    const typo = `${good.slice(0, -1)}${good.endsWith('q') ? 'p' : 'q'}`;
+    let caught: unknown;
+    try {
+      parseSecretKey(typo);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PosterError);
+    const e = caught as PosterError;
+    expect(e.code).toBe('VALIDATION');
+    expect(e.message).not.toContain(typo.slice(5));
+    expect(e.message).not.toContain(good.slice(-6));
+    expect(JSON.stringify({ message: e.message, stack: e.stack, cause: e.cause })).not.toContain(
+      typo.slice(10, 40),
+    );
+    expect(e.cause).toBeUndefined();
   });
 });

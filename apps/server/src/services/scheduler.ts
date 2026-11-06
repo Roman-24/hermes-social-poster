@@ -285,6 +285,9 @@ export class Scheduler {
       rendered = {
         ...r.rendered,
         targetId,
+        // The time frozen at confirm, not one re-resolved from a relative schedule at render time:
+        // adapters may derive stable values from it (the Nostr event timestamp).
+        scheduledAtUtc: target.scheduledAtUtc,
         publishedRemoteIds: target.remoteIds.length ? target.remoteIds : undefined,
       };
       // Media errors surface here (e.g. purged files). Text/limit issues were frozen at confirm time.

@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { copyFile, readFile, writeFile } from 'node:fs/promises';
 import { basename, extname, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
-import { eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { fileTypeFromBuffer } from 'file-type';
 import sharp from 'sharp';
 import {
@@ -498,18 +498,39 @@ export class MediaService {
   /* Retention                                                            */
   /* ------------------------------------------------------------------ */
 
-  /** Delete files for the given media ids; rows stay with purgedAt set. */
+  /**
+   * Delete files for the given media ids; rows stay with purgedAt set.
+   *
+   * Files live in media/<sha256>/ and every ingest of the same bytes makes a new row that shares
+   * that directory (original, variants, thumbnail). The directory is therefore removed only when no
+   * other un-purged row outside this batch still points at it; otherwise just this row is marked
+   * purged and the directory goes with the last row that uses it.
+   */
   purgeFiles(ids: string[]): number {
+    const batch = new Set(ids);
     let n = 0;
     for (const id of ids) {
       const row = this.db.select().from(mediaTable).where(eq(mediaTable.id, id)).get();
       if (!row || row.purgedAt) continue;
-      const dir = join(row.originalPath, '..');
-      try {
-        rmSync(dir, { recursive: true, force: true });
-        n++;
-      } catch (err) {
-        this.logger.warn({ err, id }, 'media purge failed');
+      const sharedWithLiveRow = this.db
+        .select({ id: mediaTable.id })
+        .from(mediaTable)
+        .where(
+          and(
+            eq(mediaTable.sha256, row.sha256),
+            isNull(mediaTable.purgedAt),
+            ne(mediaTable.id, id),
+          ),
+        )
+        .all()
+        .some((r) => !batch.has(r.id));
+      if (!sharedWithLiveRow) {
+        try {
+          rmSync(join(row.originalPath, '..'), { recursive: true, force: true });
+          n++;
+        } catch (err) {
+          this.logger.warn({ err, id }, 'media purge failed');
+        }
       }
       this.db
         .update(mediaTable)

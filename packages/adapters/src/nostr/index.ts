@@ -31,7 +31,7 @@ import {
   type RenderedPost,
   type SelfTestResult,
 } from '@poster/core';
-import { uploadToBlossom } from './blossom.js';
+import { blobUrl, sha256OfFile, uploadToBlossom } from './blossom.js';
 
 // nostr-tools needs a WebSocket implementation under Node < 22; newer Node has a global one.
 if (typeof WebSocket === 'undefined') {
@@ -55,7 +55,17 @@ export interface NostrMeta {
 export function parseSecretKey(input: string): Uint8Array {
   const s = input.trim();
   if (/^nsec1[02-9ac-hj-np-z]+$/i.test(s)) {
-    const decoded = nip19.decode(s.toLowerCase());
+    let decoded: ReturnType<typeof nip19.decode>;
+    try {
+      decoded = nip19.decode(s.toLowerCase());
+    } catch {
+      // The library's message quotes the whole input, checksum included. Never forward it, and
+      // never attach it as `cause`: it would end up in a log line.
+      throw new PosterError(
+        'VALIDATION',
+        'That nsec is not valid (checksum mismatch). Check it for typos.',
+      );
+    }
     if (decoded.type !== 'nsec') throw new PosterError('VALIDATION', 'Not an nsec key.');
     return decoded.data;
   }
@@ -144,7 +154,13 @@ export async function publishEvent(
   const failures: string[] = [];
   let ok = 0;
   results.forEach((r, i) => {
-    if (r.status === 'fulfilled') ok++;
+    // A relay that already holds this exact event answers "duplicate:"; it has the note, so it
+    // counts. This is what makes re-sending the same signed event after a partial failure safe.
+    if (
+      r.status === 'fulfilled' ||
+      (r.reason instanceof Error && /^\s*duplicate:/i.test(r.reason.message))
+    )
+      ok++;
     else
       failures.push(
         `${relays[i]}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
@@ -272,9 +288,15 @@ export function createNostrAdapter(): NetworkAdapter {
             const mediaUrls = await uploadPartMedia(part, sk, ctx);
             const rootId = published[0];
             const parentId = published[published.length - 1];
+            // created_at is part of the event id. Derive it from the time the target was scheduled
+            // (frozen at confirm) plus the part index, never from the clock, so a retry after a
+            // partial acknowledgement re-sends the SAME signed event and relays deduplicate it,
+            // instead of the first attempt's note staying live next to a second, different one.
+            const createdAt = Math.floor(post.scheduledAtUtc / 1000) + idx;
             const template = buildNoteTemplate(
               { text: part.text, mediaUrls },
               rootId && parentId ? { rootId, parentId, relayHint, pubkey } : null,
+              createdAt,
             );
             const event = finalizeEvent(template, sk);
             ctx.logger.info(
@@ -375,8 +397,15 @@ async function uploadPartMedia(
 ): Promise<{ media: MediaRef; url: string }[]> {
   const out: { media: MediaRef; url: string }[] = [];
   for (const media of part.media) {
-    if (media.blossomUrls && media.blossomUrls.length > 0) {
-      out.push({ media, url: media.blossomUrls[0] as string });
+    // Everything below is bound to the bytes that are really uploaded (the variant), not to
+    // the original file the MediaRef hash describes.
+    const uploadedSha = await sha256OfFile(media.path);
+    const withHash: MediaRef = { ...media, sha256: uploadedSha };
+    // Reuse a cached URL only if it is exactly what we would build for the current server and
+    // these bytes; a poisoned row or a URL from a server that is no longer configured is ignored.
+    const expected = blobUrl(ctx.settings.blossom.primary, uploadedSha, media.mime);
+    if (media.blossomUrls?.[0] === expected) {
+      out.push({ media: withHash, url: expected });
       continue;
     }
     const result = await uploadToBlossom(media, sk, {
@@ -387,7 +416,7 @@ async function uploadPartMedia(
     });
     media.blossomUrls = result.urls;
     await ctx.cacheMediaUrls?.(media.id, result.urls);
-    out.push({ media, url: result.urls[0] as string });
+    out.push({ media: withHash, url: result.urls[0] as string });
   }
   return out;
 }

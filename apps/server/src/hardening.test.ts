@@ -1,10 +1,12 @@
 import argon2 from 'argon2';
+import { existsSync } from 'node:fs';
 import { and, eq, isNull } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
 import { newId, type DraftPreview } from '@poster/core';
 import {
   draftCodes,
+  media as mediaTable,
   notifications as notificationsTable,
   posts,
   postTargets,
@@ -617,5 +619,49 @@ describe('the webhook outbox parks rows that gave up', () => {
     await notifier.retry(oldIds[0]!);
     expect(calls.filter((u) => u.endsWith('/old-route'))).toHaveLength(23);
     expect(row(oldIds[0]!).nextAttemptAt).toBeNull();
+  });
+});
+
+describe('media retention does not delete files another row still uses', () => {
+  const row = (id: string) =>
+    env.services.db.select().from(mediaTable).where(eq(mediaTable.id, id)).get()!;
+
+  it('keeps the shared directory until the last row that uses it is purged', async () => {
+    const buf = await png();
+    const a = await env.services.media.ingestBuffer(buf);
+    const b = await env.services.media.ingestBuffer(buf);
+    expect(row(a.id).originalPath).toBe(row(b.id).originalPath);
+    const original = row(b.id).originalPath;
+
+    // B is on a post scheduled further out than the retention window; A is an old orphan.
+    const d = await env.services.posts.createDraft(
+      { text: 'with image', networks: ['bluesky'], mediaIds: [b.id], schedule: inDays(60) },
+      'ui',
+    );
+    await env.services.posts.confirm(d.draftId, { trusted: true, actor: 'ui' });
+    env.services.db
+      .update(mediaTable)
+      .set({ createdAt: Date.now() - 40 * 86_400_000 })
+      .where(eq(mediaTable.id, a.id))
+      .run();
+
+    env.services.jobs.runRetention();
+    expect(row(a.id).purgedAt).not.toBeNull();
+    expect(row(b.id).purgedAt).toBeNull();
+    expect(existsSync(original)).toBe(true);
+    const info = env.services.media.get(b.id);
+    await expect(
+      env.services.media.variantFor(info, 'bluesky', env.services.settings.limitsFor('bluesky')),
+    ).resolves.toBeDefined();
+
+    // Once B's post is final and old, the last user of the directory goes and so does the directory.
+    env.services.db
+      .update(posts)
+      .set({ status: 'published', updatedAt: Date.now() - 40 * 86_400_000 })
+      .where(eq(posts.id, d.draftId))
+      .run();
+    env.services.jobs.runRetention();
+    expect(row(b.id).purgedAt).not.toBeNull();
+    expect(existsSync(original)).toBe(false);
   });
 });

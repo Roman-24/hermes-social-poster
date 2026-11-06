@@ -86,24 +86,37 @@ export function createXAdapter(browser: BrowserManagerApi): NetworkAdapter {
     });
   };
 
+  /**
+   * Look for the tweet THIS attempt just created when X returned no id. A match must be a plain
+   * tweet by this account, created after the attempt started (minus a little clock skew), not one
+   * already recorded for this thread, with exactly the same normalised, non-empty text. Anything
+   * weaker (an older identical tweet, a prefix match, a retweet, "any item" for a media-only part)
+   * would record a post that was never made as published and attach later thread parts to it.
+   * When in doubt this returns null and the target stays UNKNOWN_OUTCOME for the operator.
+   */
   const findRecent = async (
     text: string,
     account: AccountState,
     _ctx: AdapterContext,
+    opts: { notBefore: number; known: readonly string[] } = {
+      notBefore: Date.now() - 5 * 60_000,
+      known: [],
+    },
   ): Promise<{ url: string; remoteId: string } | null> => {
     const meta = metaOf(account);
     if (!meta.userId) return null;
+    const wanted = normalizeText(text);
+    if (!wanted) return null; // media-only parts cannot be matched by text
     try {
       const client = makeClient(account);
       const timeline = await client.user.timeline(meta.userId, 20);
-      const wanted = normalizeText(text);
       for (const tweet of timeline.list) {
-        if (
-          normalizeText(tweet.fullText) === wanted ||
-          normalizeText(tweet.fullText).startsWith(wanted.slice(0, 120))
-        ) {
-          return { url: tweet.url || statusUrl(meta.userName, tweet.id), remoteId: tweet.id };
-        }
+        if (opts.known.includes(tweet.id)) continue;
+        if (tweet.retweetedTweet || tweet.tweetBy?.id !== meta.userId) continue;
+        const created = Date.parse(tweet.createdAt);
+        if (!Number.isFinite(created) || created < opts.notBefore) continue;
+        if (normalizeText(tweet.fullText) !== wanted) continue;
+        return { url: tweet.url || statusUrl(meta.userName, tweet.id), remoteId: tweet.id };
       }
     } catch {
       // Best-effort only.
@@ -379,12 +392,16 @@ export function createXAdapter(browser: BrowserManagerApi): NetworkAdapter {
         const replyTo = i > 0 ? remoteIds[i - 1] : undefined;
         ctx.signal?.throwIfAborted();
         let id: string;
+        const attemptedAt = Date.now();
         try {
           id = await postPartWithRettiwt(client, part, replyTo, ctx);
         } catch (rawErr) {
           const err = mapXError(rawErr);
           if (err.code === 'UNKNOWN_OUTCOME') {
-            const found = await findRecent(part.text, account, ctx);
+            const found = await findRecent(part.text, account, ctx, {
+              notBefore: attemptedAt - 60_000,
+              known: remoteIds,
+            });
             if (found) {
               id = found.remoteId;
               ctx.logger.warn(
